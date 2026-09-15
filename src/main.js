@@ -33,6 +33,7 @@ import { Loader, watchFocus } from './core/loader.js';
 import { Save } from './core/save.js';
 import { hashFloat } from './core/rng.js';
 import { Sound } from './audio/sound.js';
+import { TIERS, pickTier, gpuName, ResolutionGovernor } from './core/quality.js';
 
 /* ------------------------------------------------------------------ *
  * country-road -- entry point.
@@ -152,29 +153,12 @@ const canvas = document.getElementById('view');
  * renders correctly when the same build is opened by hand. */
 const RECORDING = new URLSearchParams(location.search).has('rec');
 
-/**
- * How hard to work the GPU.
- *
- * A phone is not a small desktop, and the two numbers that cost the most
- * here are the ones a phone can least afford: a 3072-square shadow map
- * redrawn every frame, and a volumetric cloud march at half the render
- * target.  `low` halves the first and takes a fifth off the second, and
- * drops the scene's supersample from 1.75x to 1.25x -- which softens the
- * ink lines slightly and is the only one of the three anybody can see.
- *
- * Chosen by the pointer, not by the user agent: `(pointer: coarse)` is a
- * fact about the device in the hand, and a string of browser names is a
- * list that is wrong the day after it is written.  `?quality=high` on a
- * phone and `?quality=low` on a desktop both work, which is the only way
- * to compare the two at all.  Never on under `?rec`: the films and the
- * captured stills have to be the same picture on every machine.
- */
-const QUALITY = params.get('quality')
-  || (!RECORDING && coarsePointer() ? 'low' : 'high');
-const LOW = QUALITY === 'low';
-
+/* `antialias` only under `?flat`.  With the cel pipeline the scene is
+ * drawn into its own render target and the only thing that ever reaches
+ * the canvas is the FXAA pass, so a multisampled canvas was a 4x buffer
+ * resolved every frame for a full-screen quad that has no edges in it. */
 const renderer = new THREE.WebGLRenderer({
-  canvas, antialias: true, powerPreference: 'high-performance', stencil: false,
+  canvas, antialias: !CEL, powerPreference: 'high-performance', stencil: false,
   preserveDrawingBuffer: RECORDING,
 });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -182,7 +166,28 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-setAnisotropy(renderer.capabilities.getMaxAnisotropy());
+/**
+ * How hard to work the GPU -- see `core/quality.js`.
+ *
+ * A phone is not a small desktop, and neither is a laptop drawing on the
+ * graphics inside its CPU.  The tier comes from `?quality=`, then from the
+ * films (`?rec` is always `high`: the films and the captured stills have
+ * to be the same picture on every machine), then from the pointer -- a
+ * finger is `low` -- and last from the GPU's own name, where integrated
+ * graphics are `medium`.  `?quality=high` on a laptop and `?quality=low`
+ * on a desktop both work, which is the only way to compare them at all.
+ *
+ * The tier is a starting point; `governor` below moves the render scale
+ * from the frame rate the machine actually manages.
+ */
+const GPU = gpuName(renderer.getContext());
+const TIER = pickTier({
+  param: params.get('quality'), recording: RECORDING, coarse: coarsePointer(), gpu: GPU,
+});
+const Q = TIERS[TIER.name];
+console.log('[quality]', TIER.name, '-', TIER.why, GPU ? `(${GPU})` : '');
+
+setAnisotropy(Math.min(Q.anisotropy, renderer.capabilities.getMaxAnisotropy()));
 
 const scene = new THREE.Scene();
 /** How far the world is drawn, in metres. */
@@ -263,7 +268,7 @@ sun.castShadow = true;
  * is a heightfield question and not a shadow-map one.
  */
 const SH = 200;
-const SHADOW_MAP = LOW ? 1536 : 3072;
+const SHADOW_MAP = Q.shadowMap;
 /** How far above its target the shadow rig always sits, in metres. */
 const SHADOW_HEIGHT = 300;
 /** Metres per shadow texel.  The biases below are written in these. */
@@ -310,7 +315,9 @@ terrain.road = road;
  * ran out inside the fog on the flanks, and the sky dome showed through
  * the gap in exactly the fog's colour -- so it read as haze rather than as
  * missing world, which is why it survived two rounds of stills. */
-const chunks = new ChunkField(scene, terrain, road, { radius: VIEW_DIST, forward: 0.7 });
+const chunks = new ChunkField(scene, terrain, road, {
+  radius: VIEW_DIST, forward: 0.7, farLod: Q.farLod,
+});
 /**
  * How far ahead of the car the road is kept traced, in metres of tarmac.
  *
@@ -367,7 +374,8 @@ weather.field = cloudField;
 const clouds = CLOUD_MODE === 'off'
   ? null
   : new Clouds(scene, {
-      scale: CLOUD_MODE === 'full' ? 1 : (LOW ? 0.4 : 0.5),
+      scale: CLOUD_MODE === 'full' ? 1 : Q.cloudScale,
+      history: CLOUD_MODE === 'full' ? 1 : Q.cloudHistory,
       temporal: CLOUD_MODE !== 'raw',
       maxStep: Number(params.get('maxstep')) || undefined,
       field: cloudField,
@@ -1267,7 +1275,7 @@ function tick(dt) {
  * window, which reads as a perfectly smooth vertical gradient and looks
  * exactly like a sky with no world in it. */
 const pipeline = CEL ? new Pipeline(renderer, scene, camera,
-  LOW ? { maxScale: 1.25 } : {}) : null;
+  { maxScale: Q.scale }) : null;
 
 /**
  * `?sky=only`: hide everything that is not the sky.
@@ -1329,6 +1337,17 @@ addEventListener('orientationchange', () => setTimeout(resize, 150));
 visualViewport?.addEventListener('resize', resize);
 resize();
 
+/* Dynamic resolution: the render scale follows the frame rate, inside the
+ * tier's range.  Never under `?rec`, whose frames are stepped by a script
+ * at whatever speed the machine manages and have to be the same picture
+ * every time, and never without the cel pipeline, which is what scales. */
+const governor = new ResolutionGovernor({
+  scale: Q.scale, minScale: Q.minScale, maxScale: Q.maxScale,
+  enabled: !RECORDING && !!pipeline && params.get('dynres') !== '0',
+  effective: (s) => pipeline.scaleFor(innerWidth, innerHeight, s),
+  apply: (s) => { pipeline.maxScale = s; resize(); },
+});
+
 /* The recorder drives `step()` itself at a fixed dt, so thirty steps are
  * one second of film however long the machine takes over them, and the
  * film is the same film every time.  A hook rather than a monkeypatch on
@@ -1341,7 +1360,9 @@ function frame() {
    * the chunk field and the road, and `draw` would still cost a frame for
    * a picture nobody can see behind an opaque overlay. */
   if (paused) return;
-  const dt = Math.min(0.05, wall.getDelta());
+  const raw = wall.getDelta();
+  const dt = Math.min(0.05, raw);
+  governor.frame(raw);
   tick(dt);
   draw();
   requestAnimationFrame(frame);
@@ -1465,7 +1486,9 @@ window.__game = {
   car, chase, auto, input, hud, sky, furniture, pipeline, physics, pointer,
   sound,
   clock, weather, atmos, celestial, precip, headlights, save, loader, lapse,
-  cloudField, clouds, touch,
+  cloudField, clouds, touch, governor,
+  /** Which tier, why, and on what -- see `core/quality.js`. */
+  quality: { tier: TIER.name, why: TIER.why, gpu: GPU },
   /** For `tools/probe/rest.mjs`: what `Z` would do, and doing it. */
   restLabel, restTarget, rest,
   /** Dismiss the load screen from a script.  A probe that cannot click

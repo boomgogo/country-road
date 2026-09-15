@@ -941,11 +941,16 @@ export class Clouds {
    * @param {number} maxStep  the march's longest stride.  `?maxstep=450`
    *   is the pre-`plan_9` layer, i.e. what the horizontal layering looks
    *   like.  Swept by `rings.mjs`.
+   * @param {number} history  fraction of the render target the history is
+   *   kept at.  1 is the resolve as designed; `core/quality.js` takes it to
+   *   a half on integrated graphics, where the resolve's nine-tap clip box
+   *   over every pixel of a supersampled frame is a cost in its own right.
    */
   constructor(scene, { scale = 0.5, field = null, temporal = true,
-                       maxStep = MAX_STEP } = {}) {
+                       maxStep = MAX_STEP, history = 1 } = {}) {
     this.maxStep = maxStep;
     this.scale = scale;
+    this.history = history;
     this.temporal = temporal;
     this.rt = new THREE.WebGLRenderTarget(2, 2, {
       depthBuffer: false, stencilBuffer: false,
@@ -1127,7 +1132,8 @@ export class Clouds {
     this.rt.setSize(Math.max(2, Math.round(w * this.scale)),
                     Math.max(2, Math.round(h * this.scale)));
     if (this.hist) {
-      const hw = Math.max(2, Math.round(w)), hh = Math.max(2, Math.round(h));
+      const hw = Math.max(2, Math.round(w * this.history));
+      const hh = Math.max(2, Math.round(h * this.history));
       for (const rt of this.hist) rt.setSize(hw, hh);
       /* Resizing a render target reallocates it, so the history is now
        * two frames of undefined memory reprojected against a projection

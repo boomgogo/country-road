@@ -70,6 +70,50 @@ const CAR_LOD = [
   { within: Infinity, step: 16 },
 ];
 
+/**
+ * The *coarsest* spacing allowed at a distance from the car, and the
+ * reverse of the two tables above: those say how fine a chunk must be,
+ * this says how fine it is allowed to stay.
+ *
+ * Without it the road corridor was 1 m for as far as the road was traced
+ * -- 63 chunks and 2.06 million of the frame's 2.2 million triangles on
+ * `?seed=country`, most of them a kilometre or more down the road, where a
+ * 1 m triangle is a fraction of a pixel.  Sub-pixel triangles are the
+ * worst case a GPU has: every one of them shades a full 2x2 block for the
+ * derivatives, so the ground's fifteen-tap texture body ran several times
+ * per pixel of distant hillside, each tap at 16x anisotropic.  Measured on
+ * an Intel HD 630 with the 1 m chunks hidden, the scene pass went from 42
+ * to 15 ms.
+ *
+ * The corridor half of the header's argument still holds -- a chunk with
+ * the road in it must not be built so coarse that the carriageway falls
+ * between two vertices -- so the cap stops at 4 m, which keeps two
+ * vertices across the tarmac.  Chunks refine as the car approaches, and
+ * the extra builds are cheap: a chunk is built at 4, 2 and then 1 m, and
+ * the two coarse builds together cost 5/16 of the fine one.
+ *
+ * Per quality tier, from `core/quality.js`.  Distances are to the nearest
+ * point of the chunk, like `CAR_LOD`, and the 1 m band is always wider
+ * than `CAR_LOD`'s so the physics colliders near the car are unchanged.
+ */
+export const FAR_LOD = {
+  high: [
+    { within: 420, step: 1 },
+    { within: 820, step: 2 },
+    { within: Infinity, step: 4 },
+  ],
+  medium: [
+    { within: 200, step: 1 },
+    { within: 460, step: 2 },
+    { within: Infinity, step: 4 },
+  ],
+  low: [
+    { within: 150, step: 1 },
+    { within: 340, step: 2 },
+    { within: Infinity, step: 4 },
+  ],
+};
+
 function bandFor(table, dist) {
   for (const b of table) if (dist < b.within) return b.step;
   return 16;
@@ -96,6 +140,11 @@ export class ChunkField {
     this.radius = opts.radius ?? 620;
     this.forward = opts.forward ?? 1.6;
     this.budgetMs = opts.budgetMs ?? 4;
+    /** The coarsest spacing allowed by distance from the car.  See `FAR_LOD`. */
+    this.farLod = opts.farLod ?? FAR_LOD.high;
+    /* Road distance for cells that are not live, for `_neighbourStep`.
+     * See `_relod`. */
+    this._roadDistCache = new Map();
 
     this.live = new Map();      // key -> chunk
     this.pool = new Map();      // step -> [geometry]
@@ -199,8 +248,13 @@ export class ChunkField {
    * it, and building that at 8 m spacing puts the carriageway between two
    * vertices.
    */
-  _lodFor(ox, oz) {
-    return Math.min(lodFor(this._roadDist(ox, oz)), this._carLod(ox, oz));
+  _lodFor(ox, oz, dRoad = this._roadDist(ox, oz)) {
+    return this._capLod(Math.min(lodFor(dRoad), this._carLod(ox, oz)), ox, oz);
+  }
+
+  /** `step`, made no finer than `FAR_LOD` allows.  `scale` as `_carLod`. */
+  _capLod(step, ox, oz, scale = 1) {
+    return Math.max(step, bandFor(this.farLod, this._carDist(ox, oz) * scale));
   }
 
   /** Distance from a chunk to the midline, from its nearest corner or centre. */
@@ -379,11 +433,19 @@ export class ChunkField {
       const ox = c.ix * CHUNK, oz = c.iz * CHUNK;
       if (n >= this._scan && n < this._scan + slice) c.dRoad = this._roadDist(ox, oz);
       const roadStep = lodFor(c.dRoad);
-      c.want = Math.min(roadStep, this._carLod(ox, oz));
-      c.relax = Math.min(roadStep, this._carLod(ox, oz, 0.8));
+      c.want = this._capLod(Math.min(roadStep, this._carLod(ox, oz)), ox, oz);
+      /* The same hang-back on the far cap: `_capLod` at 0.8 of the distance
+       * is never coarser than at 1.0, so `relax <= want` still holds and a
+       * chunk between the two is left alone. */
+      c.relax = this._capLod(Math.min(roadStep, this._carLod(ox, oz, 0.8)), ox, oz, 0.8);
     }
     this._scan += slice;
-    if (this._scan >= entries.length) this._scan = 0;
+    if (this._scan >= entries.length) {
+      this._scan = 0;
+      /* The neighbour cache goes stale on the same cycle as `c.dRoad` does,
+       * which is the staleness the live chunks already accept. */
+      this._roadDistCache.clear();
+    }
 
     /* Pass two: rebuild anything at the wrong resolution, or stitched to a
      * neighbour that has since changed its own. */
@@ -414,7 +476,23 @@ export class ChunkField {
     const dz = i === 0 ? -1 : i === 1 ? 1 : 0;
     const n = this.live.get(ChunkField.key(c.ix + dx, c.iz + dz));
     if (n) return n.want !== undefined ? n.want : n.step;
-    return this._lodFor((c.ix + dx) * CHUNK, (c.iz + dz) * CHUNK);
+    /* A cell that is not live has no `dRoad` of its own, and asking the
+     * road for one is five ring searches -- for every edge of every chunk
+     * on the rim of the field, every frame.  That was 40 % of the CPU
+     * profile of a drive, so it is remembered until the next scan. */
+    const ix = c.ix + dx, iz = c.iz + dz;
+    return this._lodFor(ix * CHUNK, iz * CHUNK, this._cellRoadDist(ix, iz));
+  }
+
+  /** `_roadDist` for a cell, remembered until the scan wraps.  See above. */
+  _cellRoadDist(ix, iz) {
+    const k = ChunkField.key(ix, iz);
+    let d = this._roadDistCache.get(k);
+    if (d === undefined) {
+      d = this._roadDist(ix * CHUNK, iz * CHUNK);
+      this._roadDistCache.set(k, d);
+    }
+    return d;
   }
 
   /**
@@ -427,6 +505,8 @@ export class ChunkField {
    * queue and budget as everything else.
    */
   invalidate(minX, minZ, maxX, maxZ) {
+    /* The road moved, so every remembered distance to it may be wrong. */
+    this._roadDistCache.clear();
     /* A chunk whose build is already under way cannot simply be queued
      * again -- `pending` would swallow the request, and the generator now
      * in flight is the one holding the stale heights.  So it is noted
@@ -499,6 +579,7 @@ export class ChunkField {
     this.live.clear();
     this.pending.clear();
     this.stale.clear();
+    this._roadDistCache.clear();
     this.queue.length = 0;
     this.building = null;
     this.buildingAt = null;
@@ -650,11 +731,15 @@ export class ChunkField {
      * chosen neighbour steps are kept on the chunk and `_relod` rebuilds
      * whenever one of them changes.  Without that the seam it was stitched
      * to would move out from under it and open a crack. */
+    /* Through the same cache `_neighbourStep` reads, so the two agree:
+     * a fresh answer here against a remembered one there reads as a
+     * neighbour that changed, and rebuilds this chunk every frame until
+     * the cache turns over. */
     const nb = [
-      this._lodFor(ox, oz - CHUNK),          // -z
-      this._lodFor(ox, oz + CHUNK),          // +z
-      this._lodFor(ox - CHUNK, oz),          // -x
-      this._lodFor(ox + CHUNK, oz),          // +x
+      this._lodFor(ox, oz - CHUNK, this._cellRoadDist(ix, iz - 1)),   // -z
+      this._lodFor(ox, oz + CHUNK, this._cellRoadDist(ix, iz + 1)),   // +z
+      this._lodFor(ox - CHUNK, oz, this._cellRoadDist(ix - 1, iz)),   // -x
+      this._lodFor(ox + CHUNK, oz, this._cellRoadDist(ix + 1, iz)),   // +x
     ];
 
     const geo = this._take(step);

@@ -299,12 +299,26 @@ export class Pipeline {
     i.uInk.value.copy(d.inkColour).lerp(this._nightInk, night);
   }
 
-  setSize(w, h) {
+  /**
+   * The scale a `maxScale` of `limit` really draws at, for a w x h window.
+   *
+   * Capped by the screen's density and by the pixel budget, so two limits
+   * can come out the same -- which `ResolutionGovernor` needs to know, or
+   * it takes a step that changes nothing and concludes that stepping does
+   * not help.  Below 1 is allowed now: that is the governor on a GPU that
+   * cannot hold the frame rate at the window's own resolution.
+   */
+  scaleFor(w, h, limit = this.maxScale) {
     const dpr = window.devicePixelRatio || 1;
-    let scale = Math.min(this.maxScale, dpr < 1.5 ? 1.5 : Math.min(dpr, 2));
+    let scale = Math.min(limit, dpr < 1.5 ? 1.5 : Math.min(dpr, 2));
     if (w * h * scale * scale > this.pixelBudget) {
-      scale = Math.max(1, Math.sqrt(this.pixelBudget / (w * h)));
+      scale = Math.max(Math.min(1, limit), Math.sqrt(this.pixelBudget / (w * h)));
     }
+    return scale;
+  }
+
+  setSize(w, h) {
+    const scale = this.scaleFor(w, h);
     this.scale = scale;
     const rw = Math.max(2, Math.floor(w * scale));
     const rh = Math.max(2, Math.floor(h * scale));
