@@ -1,0 +1,32 @@
+/**
+ * Cloudflare Workers deployment.
+ *
+ * `country road` is an entirely client-side Vite build -- three.js, a
+ * rapier wasm blob inlined as base64, and three static files -- so there
+ * is no `main` here at all.  A Worker with only an `assets` block is a
+ * pure static-asset Worker: Cloudflare serves `dist/` straight off the
+ * edge and no JavaScript of ours ever runs per-request.  Add `main` only
+ * if the project ever grows an API.
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "country-road",
+  "compatibility_date": "2026-08-25",
+  "preview_urls": false,
+
+  "assets": {
+    "directory": "./dist"
+
+    /* Deliberately no `not_found_handling`.  The default -- a real 404 --
+     * is what this app wants.  The `single-page-application` setting
+     * answers *every* miss with `index.html` at status 200, and
+     * `celestial.js` fetches `stars.bin` and only checks `res.ok`: under
+     * SPA handling a missing catalogue would come back as 200 OK and get
+     * unpacked as HTML bytes into star positions.  There is no client-side
+     * router here, so there is nothing to gain in exchange. */
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

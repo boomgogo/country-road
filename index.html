@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- The same drawing, rendered, for the one place that will not take the
+         SVG: iOS puts this on the home screen, and without it it puts a
+         screenshot of the page there instead.  The touch build is meant to
+         be installed that way -- see `core/touch.js` and the
+         `mobile-web-app-capable` line below. -->
+    <link rel="apple-touch-icon" href="/icon-180.png" />
+    <!-- `user-scalable=no` and `viewport-fit=cover`: the page is a game, not a
+         document.  A double-tap that zooms the canvas, or a pinch that scales
+         the page rather than moving the camera, is a control that fights the
+         one it looks like.  `cover` puts the canvas behind the notch and the
+         home indicator; every control below keeps clear of them with
+         `env(safe-area-inset-*)`.
+
+         `user-scalable=no` is a request, and Safari has declined it since
+         iOS 10 -- so it stops nothing on the device the controls are *for*.
+         What actually holds the double tap off the throttle there is
+         `_noZoom()` in `core/touch.js`; this line is for everyone else. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#20364b" />
+    <title>country road</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe6ec; }
+      /* Fixed, and `overscroll-behavior: none`: a drag that starts on the
+         canvas must never become a page scroll or a pull-to-refresh, and on
+         a phone the browser will happily make it one of those unless every
+         one of these three says otherwise. */
+      body { position: fixed; inset: 0; overscroll-behavior: none;
+             -webkit-user-select: none; user-select: none;
+             -webkit-tap-highlight-color: transparent;
+             /* No double-tap zoom anywhere the canvas's own
+                `touch-action: none` does not already cover. */
+             touch-action: manipulation; }
+      /* `touch-action: none` is what hands the gestures to `pointer.js`.
+         Without it the browser claims the pinch and the drag for its own
+         zoom and scroll, and `pointermove` stops being delivered halfway
+         through -- so the camera sticks mid-gesture, which is exactly the
+         "controls do not work" report this project keeps earning. */
+      #view { display: block; width: 100%; height: 100%; touch-action: none; }
+      .hud {
+        position: fixed; inset: 0; pointer-events: none;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.5);
+      }
+      .hud-corner { position: absolute; bottom: 22px; text-align: center; opacity: .92; }
+      .hud-left { left: 34px; } .hud-right { right: 34px; }
+      .hud-n { display: block; font-size: 26px; font-weight: 400; letter-spacing: .30em;
+               border-bottom: 1px solid rgba(255,255,255,.45); padding: 0 .2em .10em; }
+      .hud-corner i { font-style: normal; font-size: 10px; letter-spacing: .38em;
+                      opacity: .72; display: block; padding-top: 5px; }
+      .hud-hint { position: absolute; top: 20px; left: 0; right: 0; margin: 0;
+                  text-align: center; font-size: 11px; letter-spacing: .24em;
+                  opacity: .55; }
+      .hud-toast { position: absolute; bottom: 86px; left: 0; right: 0; margin: 0;
+                   text-align: center; font-size: 11px; letter-spacing: .30em;
+                   opacity: 0; transition: opacity .35s; }
+      /* Which of the two things is driving.  A toast said so for 1.8
+         seconds and then left the player with a keyboard that did nothing
+         and no way to find out why -- which is exactly how "the controls
+         are not wired up" gets reported about controls that are. */
+      .hud-mode { position: absolute; top: 44px; left: 0; right: 0; margin: 0;
+                  text-align: center; font-size: 11px; letter-spacing: .30em; }
+      /* Time, season and weather.  With a 24-minute day a player who
+         cannot see the clock cannot tell a sunset from a bug. */
+      .hud-sky { position: absolute; top: 68px; left: 0; right: 0; margin: 0;
+                 text-align: center; font-size: 10px; letter-spacing: .34em;
+                 opacity: .42; }
+      /* What Z will do, and how far through it we are.  Sits under the
+         sky line: it is about the sky, and it is only ever there when
+         there is something to rest through. */
+      .hud-rest { position: absolute; top: 92px; left: 0; right: 0; margin: 0;
+                  text-align: center; font-size: 10px; letter-spacing: .30em;
+                  opacity: 0; transition: opacity .5s ease; }
+      .hud-rest b { font-weight: 400; }
+      .hud-rest b:not(:empty)::before { content: 'Z  '; opacity: .55; }
+      .hud-rest i { display: block; height: 1px; width: 0; margin: 6px auto 0;
+                    background: rgba(255,255,255,.7); max-width: 210px; }
+      /* Which camera, and how far the wheel has moved it.
+         The mode was a 1.8-second toast, and the wheel had no readout at
+         all -- so a player who had scrolled out in one view and in in
+         another had no way to see that they were holding the two
+         framings the wrong way round.  Which is what got reported.
+         See `core/pointer.js`. */
+      .hud-cam { position: absolute; bottom: 24px; left: 0; right: 0; margin: 0;
+                 text-align: center; font-size: 10px; letter-spacing: .34em;
+                 opacity: .34; }
+      .hud-mode.auto { color: #ffd479; opacity: .85; }
+      .hud-mode.manual { opacity: .38; }
+      /* The one state the mode badge does not cover: the document has lost
+         focus, so `keydown` is going somewhere else entirely and every key
+         is dead.  A state, not an event, so not a toast. */
+      .hud-focus { position: absolute; top: 0; bottom: 0; left: 0; right: 0; margin: 0;
+                   display: none; align-items: center; justify-content: center;
+                   font-size: 12px; letter-spacing: .32em; }
+      body.blurred .hud-focus { display: flex; }
+      body.clean .hud { display: none !important; }
+
+      /* ---------------------------------------------------------------
+         The HUD, reflowed for a thumb.
+
+         Nothing here changes what the HUD *says*.  It moves four blocks
+         out of the way of the controls in `core/touch.js`, which own the
+         two bottom corners -- the two corners the miles and the speed
+         have lived in since the first commit.  The speed goes to the
+         middle, above both of them; the distance goes to the top left,
+         which on a phone is the only corner nothing else wants.
+         --------------------------------------------------------------- */
+      /* The two readouts leave the two bottom corners -- which the pad and
+         the pedals now own -- and become one pair either side of the
+         centre line, above both thumbs.  Anchored *to the centre* rather
+         than stretched across the screen: `.hud-n` draws its rule as a
+         `border-bottom`, so a full-width block draws a full-width white
+         line straight through the car. */
+      body.touch .hud-corner { bottom: calc(128px + env(safe-area-inset-bottom));
+                               text-shadow: 0 1px 4px rgba(0,0,0,.75); }
+      body.touch .hud-left  { left: auto; right: calc(50% + 13px); }
+      body.touch .hud-right { right: auto; left: calc(50% + 13px); }
+      body.touch .hud-n { font-size: 20px; }
+      body.touch .hud-corner i { font-size: 9px; padding-top: 3px; }
+      body.touch .hud-toast { bottom: calc(184px + env(safe-area-inset-bottom)); }
+      /* Held sideways there is nothing between the two thumbs at all, so
+         the pair drops to the bottom edge where it belongs. */
+      @media (orientation: landscape) {
+        body.touch .hud-corner { bottom: calc(14px + env(safe-area-inset-bottom)); }
+        body.touch .hud-toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
+      }
+      /* Which leaves the whole top of the screen to the stack.  It starts
+         below the button strip, because it is centred across the full
+         width and the strip is not. */
+      body.touch .hud-hint { display: none; }
+      body.touch .hud-mode { top: calc(48px + env(safe-area-inset-top)); font-size: 10px; }
+      body.touch .hud-sky { top: calc(70px + env(safe-area-inset-top)); }
+      body.touch .hud-rest { top: calc(92px + env(safe-area-inset-top)); }
+      /* The camera readout leaves the bottom edge, where the pedals now
+         are, and joins the stack it belongs to.  It is the *state* of a
+         gesture -- see `core/pointer.js` -- so it cannot become a toast. */
+      body.touch .hud-cam { bottom: auto; top: calc(114px + env(safe-area-inset-top)); }
+      /* `Z` is a key this device does not have.  The panel button is the
+         same command under the name the button carries. */
+      body.touch .hud-rest b:not(:empty)::before { content: 'REST  '; }
+
+      /* ---------------------------------------------------------------
+         The touch controls.
+
+         Built by `core/touch.js`, which adds `body.touch` when it decides
+         there is a finger.  The layer is inert -- `pointer-events: none`
+         -- everywhere except the controls themselves, so the whole of the
+         rest of the screen keeps dragging the camera the way the mouse
+         always did.
+
+         Above the HUD (which has no z-index of its own) and below the
+         load screen's 10, so the pause menu covers the controls rather
+         than being tapped through.
+         --------------------------------------------------------------- */
+      .tc {
+        position: fixed; inset: 0; z-index: 6; display: none;
+        pointer-events: none; touch-action: none;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.5);
+        -webkit-user-select: none; user-select: none;
+        -webkit-touch-callout: none;
+      }
+      body.touch .tc { display: block; }
+      body.clean .tc { display: none !important; }
+      .tc-steer, .tc-pedal, .tc-pad, .tc-btn {
+        pointer-events: auto; touch-action: none;
+        display: flex; align-items: center; justify-content: center;
+        border: 1px solid rgba(255,255,255,.30);
+        background: rgba(14,22,30,.22);
+        transition: background .12s ease, border-color .12s ease;
+      }
+      .tc-steer.on, .tc-pedal.on, .tc-pad.on, .tc-btn.on {
+        background: rgba(255,255,255,.22); border-color: rgba(255,255,255,.62);
+      }
+      /* The pad.  Wide and short, because the gesture it reads is a thumb
+         sweeping sideways and nothing else -- see `_steer`. */
+      .tc-steer {
+        position: absolute; overflow: hidden;
+        left: calc(14px + env(safe-area-inset-left));
+        bottom: calc(16px + env(safe-area-inset-bottom));
+        width: min(44vw, 250px); height: 88px; border-radius: 44px;
+      }
+      .tc-steer b { font-weight: 400; font-size: 9px; letter-spacing: .34em;
+                    opacity: .38; text-indent: .34em; }
+      /* Placed off the pad's centre explicitly rather than by the flex
+         box: an absolutely positioned flex child takes its static position
+         from the container's alignment, which is a thing browsers agree
+         about only mostly, and `translateX` below is measured from centre. */
+      .tc-knob {
+        position: absolute; left: 50%; top: 50%; margin: -32px 0 0 -32px;
+        width: 64px; height: 64px; border-radius: 50%;
+        border: 1px solid rgba(255,255,255,.55);
+        background: rgba(255,255,255,.10);
+      }
+      /* The pedals.  Throttle above brake, in the order a right thumb
+         rocks between them; holding the lower one at a standstill reverses,
+         which is `Vehicle`'s rule for `S` and not a separate control. */
+      .tc-pedals {
+        position: absolute;
+        right: calc(14px + env(safe-area-inset-right));
+        bottom: calc(16px + env(safe-area-inset-bottom));
+        display: flex; flex-direction: column; gap: 10px;
+      }
+      .tc-pedal { width: 76px; height: 76px; border-radius: 50%; }
+      .tc-pedal b { font-weight: 400; font-size: 20px; opacity: .8; }
+      .tc-brake b { font-size: 20px; }
+      /* Between the two thumbs, and small: the handbrake is a thing you
+         reach for on purpose, and never by accident mid-corner. */
+      .tc-hand {
+        position: absolute;
+        right: calc(102px + env(safe-area-inset-right));
+        bottom: calc(16px + env(safe-area-inset-bottom));
+        width: 62px; height: 46px; border-radius: 23px;
+      }
+      .tc-hand b { font-weight: 400; font-size: 8px; line-height: 1.35;
+                   letter-spacing: .18em; opacity: .7; text-align: center; }
+      /* The commands.  Two here and the rest behind the third, because a
+         phone screen is mostly road and every button on it is road you
+         cannot see. */
+      .tc-strip {
+        position: absolute;
+        top: calc(10px + env(safe-area-inset-top));
+        right: calc(14px + env(safe-area-inset-right));
+        display: flex; gap: 8px;
+      }
+      .tc-btn {
+        min-width: 44px; height: 34px; padding: 0 11px; border-radius: 17px;
+        font-size: 9px; letter-spacing: .22em; text-transform: uppercase;
+        opacity: .9; white-space: nowrap;
+      }
+      .tc-more { font-size: 14px; letter-spacing: 0; padding: 0 9px; }
+      .tc-panel {
+        position: absolute;
+        top: calc(52px + env(safe-area-inset-top));
+        right: calc(14px + env(safe-area-inset-right));
+        display: none; flex-direction: column; align-items: flex-end; gap: 7px;
+      }
+      .tc-panel.open { display: flex; }
+
+      /* ---------------------------------------------------------------
+         The load screen.
+
+         This markup is in the document rather than built by `loader.js`
+         for one hard reason: `main.js` opens with a top-level
+         `await initRapier()`, so no module-scope JavaScript runs at all
+         until the physics wasm has downloaded -- which is the slowest
+         part of the load and precisely what a loader exists to cover.
+         Static markup is painted with the first paint; a JS-built one
+         would appear after the wait it was meant to explain.
+         --------------------------------------------------------------- */
+      .load {
+        position: fixed; inset: 0; z-index: 10;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        background: linear-gradient(#20364b, #4d6377 62%, #9fb0ae);
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #f2f5f7; text-align: center;
+        transition: opacity .35s ease;
+      }
+      .load h1 { margin: 0 0 4px; font-size: 15px; font-weight: 400;
+                 letter-spacing: .52em; text-indent: .52em; opacity: .95; }
+      .load-step { margin: 0; font-size: 10px; letter-spacing: .30em;
+                   opacity: .5; min-height: 1.2em; }
+      .load-bar { width: 210px; height: 1px; margin: 26px 0 0;
+                  background: rgba(255,255,255,.20); overflow: hidden; }
+      .load-bar i { display: block; height: 100%; width: 0;
+                    background: rgba(255,255,255,.85); transition: width .3s ease; }
+      /* The prompt is hidden until the world is actually there, so the
+         click can never arrive before there is something to drive. */
+      .load-go { margin: 26px 0 0; font-size: 11px; letter-spacing: .34em;
+                 opacity: 0; transition: opacity .5s ease; }
+      .load.ready .load-bar { opacity: 0; transition: opacity .3s; }
+      .load.ready .load-step { opacity: 0; }
+      .load.ready .load-go { opacity: .92; animation: pulse 2.4s ease-in-out infinite; }
+      @keyframes pulse { 0%, 100% { opacity: .92; } 50% { opacity: .45; } }
+      .load-choices { display: none; gap: 26px; margin: 24px 0 0; }
+      .load.ready.resumable .load-choices { display: flex; }
+      .load.ready.resumable .load-go { display: none; }
+      .load-choices button {
+        font: inherit; font-size: 11px; letter-spacing: .28em;
+        color: #f2f5f7; background: none; padding: 9px 16px; cursor: pointer;
+        border: 1px solid rgba(255,255,255,.34);
+      }
+      .load-choices button:hover, .load-choices button:focus {
+        background: rgba(255,255,255,.12); outline: none;
+      }
+      .load-choices b { display: block; font-weight: 400; letter-spacing: .28em; }
+      .load-choices i { display: block; font-style: normal; font-size: 9px;
+                        letter-spacing: .20em; opacity: .55; padding-top: 5px; }
+      .load.gone { opacity: 0; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <!-- `tabindex` so `canvas.focus()` does something.  Without it the
+         canvas is not focusable, and the only way focus ever reaches the
+         document is a click -- which is the whole of the bug this fixes. -->
+    <canvas id="view" tabindex="0"></canvas>
+    <div class="load" id="load">
+      <h1>country road</h1>
+      <p class="load-step" id="load-step">warming up</p>
+      <div class="load-bar"><i id="load-fill"></i></div>
+      <p class="load-go" id="load-go">click or press any key to drive</p>
+      <div class="load-choices" id="load-choices">
+        <button id="load-continue" type="button"><b>continue</b><i id="load-where"></i></button>
+        <button id="load-new" type="button"><b>new drive</b><i>fresh start</i></button>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

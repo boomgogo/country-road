@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>country road</title>
+  <desc>
+    The tab icon.
+
+    What was here was `create-vite`'s lightning bolt -- 48 by 46, twenty-two
+    blurred ellipses behind an alpha mask, purple and cyan -- which for
+    sixteen iterations advertised the build tool.
+
+    Everything below is drawn from `src/core/palette.js` rather than picked:
+    skyTop #3f82c9, leafMid #5c7f42 for the far hills, grass #7d9450,
+    road #585b66, lineWhite #eceade.  The palette is narrow on purpose and
+    an icon is the narrowest place it will ever be used.
+
+    Designed for the size it is actually seen at, which is 16 px in a tab:
+    five flat shapes, no gradients, no blur, no filters, and two centre-line
+    dashes rather than three, because at 16 px three merge into a smear.
+    The viewBox is 32 so the 16 px grid lands on whole units.
+
+    This note is a `desc` and not an XML comment for a reason worth knowing:
+    the prose style of this repository uses a double hyphen, a double hyphen
+    is illegal inside an XML comment, and an SVG that is not well-formed XML
+    loads as an image of nothing -- `complete` true, `naturalWidth` 0, no
+    error anywhere.  Which is exactly how the first version of this file
+    came out as a blank tab.
+  </desc>
+  <rect width="32" height="32" fill="#3f82c9"/>
+  <path d="M0 13h32v19H0z" fill="#7d9450"/>
+  <path d="M0 13c5-3 9 1 13 0s7-3 11-2 8 2 8 2v2H0z" fill="#5c7f42"/>
+  <path d="M0 32 12.6 13h6.8L32 32z" fill="#585b66"/>
+  <path d="M15.3 16h1.4l-.3 3.4h-1.8zM14.1 22.6h2.6l-.5 6.4h-3.2z" fill="#eceade"/>
+</svg>
