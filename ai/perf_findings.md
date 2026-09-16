@@ -1,7 +1,8 @@
 # Performance on integrated graphics: findings so far (2026-09-15)
 
 Task: improve frame rate on old laptops with no dedicated GPU.
-Status: **stopped partway through.** The code changes below are uncommitted and only partly verified.
+Status: session 1 (below) was committed as `d50d06c`. **Session 2 (2026-09-16/17) found the root
+cause and fixed it; see "Session 2" at the end.** Its "Next steps" replace the ones in session 1.
 
 ## Test machine
 
@@ -214,3 +215,138 @@ Results after the changes (`dynres=0`):
 3. Verify the governor converges and doesn't oscillate. Test headed Chrome with real vsync.
 4. Take visual captures of medium against high, and the high tier before and after.
 5. Write `ai/plan_N.md` and `ai/next_N.md` per `CLAUDE.md` once the work settles.
+
+
+---
+
+# Session 2: root cause and fixes (2026-09-16/17)
+
+## Root cause
+
+**The ground shader sampled every texture for every pixel, including layers whose weight was 0.**
+`groundmat.js` read all six surface textures, twice each for the detile, plus 3 fade taps and
+the road. That is 15 anisotropic taps per ground fragment. It then blended most of them away at
+a weight of exactly 0: rock, sand, heather and gravel under an open field, and all of the grass
+under the tarmac. On an HD 630, texture taps are the expensive thing. One anisotropic tap
+across the visible ground costs about 1.5 ms at 1080p.
+
+This also answers session 1's "open puzzle". The remaining fixed cost was not headless vsync
+quantisation. Measured with vsync off (`--disable-gpu-vsync --disable-frame-rate-limit`,
+average fps over 10–12 s), hiding only the ground chunks took medium from 22.8 to 80 fps.
+Clouds, post and shadows were each worth 1–5 ms.
+
+## Method notes
+
+- **Use uncapped throughput for A/B** (`tog.mjs`, `CHROME_ARGS="--disable-gpu-vsync
+  --disable-frame-rate-limit"`). The fps is averaged over a time window, and the difference
+  between runs is about ±1 fps.
+- **readPixels-synced per-pass timings are badly inflated.** A synced frame took 95 ms against
+  a real 33 ms. The sync itself costs about 1.2 ms idle, and the rest is lost pipelining. Use
+  them only to rank passes within one run.
+- `readRenderTargetPixels` on a 1×1 target does **not** sync on Mesa/iris. It returns ~0 ms.
+- **Headed Chrome hangs on this machine** (Wayland, alongside the user's Chrome) and never
+  produces frames. Stay headless.
+- **Pixel A/B:** `ab.mjs` serves a `git archive HEAD` copy on port 5180 next to the working
+  tree on 5178. It renders the same `?rec` frame on both and diffs the 8-bit grade output.
+  Same port against itself gives 0 differing channels.
+  - The **first run after editing source** differs by ~820K channels. That is the GLB car
+    losing its 2.5 s race to the built-in coupe on a cold Vite transform. Run it again.
+- `?quality=` wins over `?rec`, so `ab.mjs` can compare any tier.
+- `ab.mjs` takes `T=21:30` for the time. Appending `&t=` to `QS` does nothing, because the
+  first `t` in the URL wins.
+
+## Changes
+
+1. **`src/world/groundmat.js`: weights first, then only the textures that show.**
+   - Every layer weight is the same expression as before, in the same order.
+   - A layer is sampled only if its weight > 0 and no layer mixed over it has a weight ≥ 1.
+     `mix(x, y, 1.0)` is `y`, so the output does not change.
+   - Samples use `textureGrad` with gradients taken once, outside the branches. The break
+     sample's gradients are `BREAK_RATIO` = 0.0461 / 0.125 times the near ones.
+   - Measured: `textureGrad` costs the same as implicit `texture`.
+   - **Pixel diff against HEAD: max 1/255**, checked at 900 m / 10:00, 4200 m / winter 15:00,
+     2500 m / rain, and at night.
+   - Ground only, high tier, 2849×1473: 94 → 38 ms synced.
+2. **`src/core/post.js`: ink and grade merged into one pass (`look`), and `rtA` removed.**
+   - `INK` and `GRADE` are defines. `enabled.ink` and `enabled.grade` recompile on toggle,
+     which also makes the `G` key work; it did nothing before.
+   - About 1 ms at 1080p. Pixel diff max 1.
+   - `ai/perf-bench/bench2.mjs` and `gpu.mjs` still reference `P.ink` and `P.grade` and are
+     now stale.
+3. **`src/world/chunks.js`: ground meshes get `renderOrder = 1`.**
+   - Opaque objects sort by material id before depth, and the ground material is created
+     first, so the ground was drawn first and then painted over by trees, rails and the car.
+   - Drawn last, it is rejected by the depth test behind them. About 2 ms.
+   - 68 of 12.6M channels differ, at exact depth ties. Nothing is visible in the diff.
+   - The only opaque object without depth write is the sky dome, at -1000.
+   - Moving the dome after the world with z = w was also tried. It gained nothing, so it was
+     not kept.
+4. **`src/main.js`: the key light is switched off by `shadow.intensity = 0` and
+   `shadow.autoUpdate = false`, not by `castShadow = false`.**
+   - Toggling `castShadow` changes the light configuration, and every lit material then
+     recompiles.
+   - That was a 375 ms freeze at the first dusk of each session (`dusk.mjs`). It is gone.
+   - The night picture diff is max 5 on a handful of pixels, and the map is still not drawn
+     at night.
+
+## Results (HD 630, headless, 1920×993 viewport)
+
+| | before (HEAD `d50d06c`) | after |
+|---|---|---|
+| medium, vsync, dynres off | 21.7 fps | 33.4 fps |
+| medium, uncapped | 22.5 | 39.7 |
+| high, uncapped (2849×1473) | 6.9 | 14.9 |
+| low, uncapped (2400×1241) | 23.0 | 34.3 |
+| medium with governor, settles at | scale 0.64, 33–44 fps | scale 0.71, 45–49 fps |
+| dusk recompile freezes | 316 ms (lamps) + 375 ms (shadow) | 484 ms (lamps) only |
+
+## Where medium's ~25 ms at scale 1 still goes (uncapped toggles)
+
+| item | ms |
+|---|---|
+| ground: texture blend (grass is 2–4 taps, fade 3, road 1) | ~9 |
+| ground: lighting and PCFSoft shadow receive (16 RGBA-unpack taps) | ~3–4 |
+| ground: geometry and vertex work | ~3 |
+| shadow pass | ~3.5 |
+| cloud march and resolve | ~3.3 |
+| FXAA | ~1.8 |
+| look (ink and grade) | ~1 |
+| everything else in the scene | ~3 |
+
+- **The empty shadow pass costs almost the full amount.** With no casters it still costs
+  ~3.5 ms, while removing trees, car or ground as casters saves only 0.2–0.8 ms each. A 1024
+  map saves ~0.7 ms. So it is not geometry, and probably a per-pass overhead (clearing 2048²
+  colour and depth, or a Mesa resolve). This is unexplained.
+- **CPU** `tick` is ~4.5 ms: noise in chunk builds (budget 4 ms) and road queries. With
+  drawing enabled, the CPU profile is dominated by GL calls blocking on GPU backpressure.
+
+## Tried and dropped
+
+- **Sky dome drawn after the world at the far plane:** no measurable gain.
+- **Background `compileAsync` warm-up of the night light configurations 1.5 s after start:**
+  it did remove the dusk hitch (490 → 73 ms). But on ANGLE-GL/Mesa, "parallel" compile still
+  blocks the GPU process, so it put a **1.1 s stall at 3.7 s into the drive** instead.
+  - It must compile into `pipeline.rtScene`, not the canvas, or it builds the wrong
+    (sRGB-output) programs.
+- **Headlights always in the light list (intensity 0):** removes the lamp hitch but costs
+  ~1 ms every frame. Not done.
+
+## Next steps
+
+1. **Dusk headlight hitch (~0.5 s, once per session).**
+   - Options: compile behind the load screen (costs load time; spec 2–3 s); keep the lamps
+     always in the list (1 ms per frame); or give them a 0 → 1 fade from a distance-gated
+     uniform so the light count never changes.
+2. **Grass taps.** `tGrass` and `tGrassDry` could be one RGBA data texture holding
+   (t_grass, speck_grass, t_dry, speck_dry), with the palettes in the shader.
+   - That halves the green layer's taps, about 3 ms.
+   - The picture changes slightly: the filter would run over the parameters rather than the
+     sRGB colours. It needs a visual check.
+3. **Shadows.**
+   - Explain the ~3.5 ms fixed cost of an empty shadow pass.
+   - On medium, a 4-tap bilinear PCF instead of three's 16-tap PCFSoft on RGBA-packed depth.
+     That changes the penumbra.
+4. **Cloud march** (~3.3 ms at 0.3 scale): it marches sky pixels that terrain will cover.
+   Last frame's depth could mask it.
+5. **Not tested:** real phones (the `low` tier), Windows/ANGLE-D3D, and headed Chrome with a
+   real display vsync.

@@ -6,8 +6,8 @@ import { PAL } from './palette.js';
  * The 3D-to-2D pipeline.
  *
  *   scene  ->  rtScene (colour + depth texture)
- *          ->  ink pass    : screen-space line work from the depth buffer
- *          ->  grade pass  : colour grade + linear->sRGB
+ *          ->  look pass   : screen-space line work from the depth buffer,
+ *                            then colour grade + linear->sRGB
  *          ->  fxaa pass   : clean up the line work, straight to screen
  *
  * Ported from `ref/dp-sakura-crossing` (MIT, same author), retuned for a
@@ -42,7 +42,16 @@ const VERT = /* glsl */ `
   }
 `;
 
-const INK = {
+/* The ink and the grade, in one full-screen pass.
+ *
+ * They were two, with a half-float render target between them, and the
+ * only thing the grade ever did with the ink's output was read it back one
+ * texel at a time -- so the target was a whole frame of memory and a whole
+ * frame of fill spent on passing a colour from one function to the next.
+ * On integrated graphics a full-screen pass is about a millisecond at
+ * 1080p.  The maths is unchanged; `INK` and `GRADE` are defines, so the
+ * `O` and `G` keys still take each one out on its own. */
+const LOOK = {
   uniforms: {
     tDiffuse: { value: null },
     tDepth: { value: null },
@@ -59,6 +68,13 @@ const INK = {
     uStrength: { value: 1.0 },
     uSkyDepth: { value: 1900.0 },
     uSlope: { value: 1.4 },
+
+    uShadowTint: { value: new THREE.Color(0xb3bdd6) },
+    uLightTint: { value: new THREE.Color(0xfff8ea) },
+    uSaturation: { value: 1.10 },
+    uLift: { value: 0.026 },
+    uVignette: { value: 0.13 },
+    uWarmth: { value: 0.04 },
   },
   vertexShader: VERT,
   fragmentShader: /* glsl */ `
@@ -70,6 +86,8 @@ const INK = {
     uniform vec3 uInk;
     uniform float uThickness, uSens, uConcave, uConcaveAmount;
     uniform float uFadeStart, uFadeEnd, uStrength, uSkyDepth, uSlope;
+    uniform vec3 uShadowTint, uLightTint;
+    uniform float uSaturation, uLift, uVignette, uWarmth;
     varying vec2 vUv;
 
     float linearDepth( vec2 uv ) {
@@ -77,12 +95,12 @@ const INK = {
       return -perspectiveDepthToViewZ( d, uNear, uFar );
     }
 
-    void main() {
-      vec3 col = texture2D( tDiffuse, vUv ).rgb;
+    /* ---- the ink: screen-space line work from the depth buffer ---- */
+    vec3 ink( vec3 col ) {
       vec2 t = uTexel * uThickness;
       float dc = linearDepth( vUv );
 
-      if ( dc > uSkyDepth ) { gl_FragColor = vec4( col, 1.0 ); return; }
+      if ( dc > uSkyDepth ) return col;
 
       float dl = linearDepth( vUv - vec2( t.x, 0.0 ) );
       float dr = linearDepth( vUv + vec2( t.x, 0.0 ) );
@@ -112,36 +130,11 @@ const INK = {
 
       // ink keeps a whisper of the underlying hue so it never looks pasted on
       vec3 line = mix( uInk, col * 0.42, 0.22 );
-      gl_FragColor = vec4( mix( col, line, clamp( edge, 0.0, 1.0 ) ), 1.0 );
-    }
-  `,
-};
-
-const GRADE = {
-  uniforms: {
-    tDiffuse: { value: null },
-    uShadowTint: { value: new THREE.Color(0xb3bdd6) },
-    uLightTint: { value: new THREE.Color(0xfff8ea) },
-    uSaturation: { value: 1.10 },
-    uLift: { value: 0.026 },
-    uVignette: { value: 0.13 },
-    uWarmth: { value: 0.04 },
-  },
-  vertexShader: VERT,
-  fragmentShader: /* glsl */ `
-    uniform sampler2D tDiffuse;
-    uniform vec3 uShadowTint, uLightTint;
-    uniform float uSaturation, uLift, uVignette, uWarmth;
-    varying vec2 vUv;
-
-    vec3 linearToSRGB( vec3 c ) {
-      return mix( c * 12.92,
-                  1.055 * pow( max( c, vec3( 0.0031308 ) ), vec3( 1.0 / 2.4 ) ) - 0.055,
-                  step( 0.0031308, c ) );
+      return mix( col, line, clamp( edge, 0.0, 1.0 ) );
     }
 
-    void main() {
-      vec3 c = texture2D( tDiffuse, vUv ).rgb;
+    /* ---- the grade ---- */
+    vec3 grade( vec3 c ) {
       float l = dot( c, vec3( 0.2126, 0.7152, 0.0722 ) );
 
       // split-tone: cool in the darks, warm paper white in the lights
@@ -153,7 +146,23 @@ const GRADE = {
 
       float r = length( vUv - 0.5 ) * 1.42;
       c *= 1.0 - uVignette * pow( clamp( r, 0.0, 1.0 ), 2.6 );
+      return c;
+    }
 
+    vec3 linearToSRGB( vec3 c ) {
+      return mix( c * 12.92,
+                  1.055 * pow( max( c, vec3( 0.0031308 ) ), vec3( 1.0 / 2.4 ) ) - 0.055,
+                  step( 0.0031308, c ) );
+    }
+
+    void main() {
+      vec3 c = texture2D( tDiffuse, vUv ).rgb;
+      #ifdef INK
+        c = ink( c );
+      #endif
+      #ifdef GRADE
+        c = grade( c );
+      #endif
       gl_FragColor = vec4( linearToSRGB( max( c, vec3( 0.0 ) ) ), 1.0 );
     }
   `,
@@ -227,26 +236,25 @@ export class Pipeline {
     this.rtScene.depthTexture.minFilter = THREE.NearestFilter;
     this.rtScene.depthTexture.magFilter = THREE.NearestFilter;
 
-    this.rtA = new THREE.WebGLRenderTarget(2, 2, { ...opts, depthBuffer: false });
     this.rtB = new THREE.WebGLRenderTarget(2, 2, {
       ...opts, type: THREE.UnsignedByteType, depthBuffer: false,
     });
 
-    this.ink = makeQuad(INK);
-    this.grade = makeQuad(GRADE);
+    this.look = makeQuad(LOOK);
     this.fxaa = makeQuad(FXAA);
-    this.ink.mat.uniforms.tDepth.value = this.rtScene.depthTexture;
+    this.look.mat.uniforms.tDepth.value = this.rtScene.depthTexture;
+    this.look.mat.defines = { INK: '', GRADE: '' };
     this.enabled = { ink: true, grade: true, fxaa: true };
     /* The daytime settings, kept so `setNight` can interpolate back to
      * them rather than accumulating drift across a game-year. */
     this.day = {
-      sat: GRADE.uniforms.uSaturation.value,
-      lift: GRADE.uniforms.uLift.value,
-      warmth: GRADE.uniforms.uWarmth.value,
-      shadow: this.grade.mat.uniforms.uShadowTint.value.clone(),
-      ink: this.ink.mat.uniforms.uStrength.value,
-      inkFade: this.ink.mat.uniforms.uFadeStart.value,
-      inkColour: this.ink.mat.uniforms.uInk.value.clone(),
+      sat: LOOK.uniforms.uSaturation.value,
+      lift: LOOK.uniforms.uLift.value,
+      warmth: LOOK.uniforms.uWarmth.value,
+      shadow: this.look.mat.uniforms.uShadowTint.value.clone(),
+      ink: this.look.mat.uniforms.uStrength.value,
+      inkFade: this.look.mat.uniforms.uFadeStart.value,
+      inkColour: this.look.mat.uniforms.uInk.value.clone(),
     };
     this._nightShadow = new THREE.Color(0x5a6c96);
     /* Near-black, for the ink at night.  See `setNight`. */
@@ -267,7 +275,7 @@ export class Pipeline {
    * @param grade  the atmosphere's own lift/gain/saturation
    */
   setNight(night, grade = null) {
-    const g = this.grade.mat.uniforms;
+    const g = this.look.mat.uniforms;
     const d = this.day;
     if (grade) {
       g.uSaturation.value = d.sat * grade.sat;
@@ -293,7 +301,7 @@ export class Pipeline {
      * *darker than the scene*, which at night means near-black -- at which
      * point the lines correctly stop being visible, because at night you
      * cannot see the outline of a hillside either. */
-    const i = this.ink.mat.uniforms;
+    const i = this.look.mat.uniforms;
     i.uStrength.value = d.ink * (1 - 0.55 * night);
     i.uFadeStart.value = d.inkFade * (1 - 0.45 * night);
     i.uInk.value.copy(d.inkColour).lerp(this._nightInk, night);
@@ -327,16 +335,16 @@ export class Pipeline {
     this.renderer.setPixelRatio(1);
     this.renderer.setSize(w, h, false);
     this.rtScene.setSize(rw, rh);
-    this.rtA.setSize(rw, rh);
     this.rtB.setSize(rw, rh);
 
     const texel = new THREE.Vector2(1 / rw, 1 / rh);
-    this.ink.mat.uniforms.uTexel.value.copy(texel);
+    const look = this.look.mat.uniforms;
+    look.uTexel.value.copy(texel);
     this.fxaa.mat.uniforms.uTexel.value.copy(texel);
-    this.ink.mat.uniforms.uNear.value = this.camera.near;
-    this.ink.mat.uniforms.uFar.value = this.camera.far;
+    look.uNear.value = this.camera.near;
+    look.uFar.value = this.camera.far;
     // scale ink weight with resolution so lines stay ~2 device px
-    this.ink.mat.uniforms.uThickness.value = 1.0 + 0.5 * scale;
+    look.uThickness.value = 1.0 + 0.5 * scale;
   }
 
   render() {
@@ -345,17 +353,19 @@ export class Pipeline {
     r.clear();
     r.render(this.scene, this.camera);
 
-    let src = this.rtScene.texture;
-    if (this.enabled.ink) {
-      this.ink.mat.uniforms.tDiffuse.value = src;
-      r.setRenderTarget(this.rtA);
-      this.ink.quad.render(r);
-      src = this.rtA.texture;
+    /* The two switches are compile-time, so a toggle is a recompile --
+     * once, on a key press, and never in the frame. */
+    const m = this.look.mat;
+    if (('INK' in m.defines) !== this.enabled.ink || ('GRADE' in m.defines) !== this.enabled.grade) {
+      m.defines = {};
+      if (this.enabled.ink) m.defines.INK = '';
+      if (this.enabled.grade) m.defines.GRADE = '';
+      m.needsUpdate = true;
     }
     const last = this.enabled.fxaa ? this.rtB : null;
-    this.grade.mat.uniforms.tDiffuse.value = src;
+    m.uniforms.tDiffuse.value = this.rtScene.texture;
     r.setRenderTarget(last);
-    this.grade.quad.render(r);
+    this.look.quad.render(r);
     if (this.enabled.fxaa) {
       this.fxaa.mat.uniforms.tDiffuse.value = this.rtB.texture;
       r.setRenderTarget(null);
@@ -365,7 +375,7 @@ export class Pipeline {
   }
 
   dispose() {
-    [this.rtScene, this.rtA, this.rtB].forEach((rt) => rt.dispose());
-    [this.ink, this.grade, this.fxaa].forEach((p) => { p.quad.dispose(); p.mat.dispose(); });
+    [this.rtScene, this.rtB].forEach((rt) => rt.dispose());
+    [this.look, this.fxaa].forEach((p) => { p.quad.dispose(); p.mat.dispose(); });
   }
 }

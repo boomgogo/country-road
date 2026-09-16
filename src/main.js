@@ -1002,7 +1002,16 @@ function paintWorld(dt, w, { moving = true, braking = false } = {}) {
    * rather than 1.1: under that the rig's 1/sin has hit its clamp, so the
    * light is no longer 300 m up and a hill inside the cascade can be
    * *above* it, which puts its shadow on the wrong side of itself. */
-  sun.castShadow = atmos.key.dir.y > 0.06 && atmos.key.level > 0.05;
+  /* Switched by the shadow's *intensity*, not by `castShadow`.  Turning
+   * `castShadow` off changes the light configuration every lit material
+   * is compiled for, so every dusk recompiled the whole scene -- a
+   * 350 ms freeze on an Intel HD 630, the first time each session.  At
+   * zero intensity the shadow term is exactly 1, which is the same
+   * picture, and with `autoUpdate` off the map is not drawn either, so the
+   * night still saves the pass. */
+  const casting = atmos.key.dir.y > 0.06 && atmos.key.level > 0.05;
+  sun.shadow.intensity = casting ? 1 : 0;
+  sun.shadow.autoUpdate = casting;
   hemi.color.copy(atmos.hemi.sky);
   hemi.groundColor.copy(atmos.hemi.ground);
   hemi.intensity = atmos.hemi.level;
