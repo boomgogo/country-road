@@ -1033,7 +1033,6 @@ function paintWorld(dt, w, { moving = true, braking = false } = {}) {
 const _ear = { car };
 function listen(dt, w, axes, lapsing) {
   _ear.brake = axes ? axes.brake : 0;
-  _ear.handbrake = axes ? axes.handbrake : 0;
   _ear.lapsing = lapsing;
   _ear.still = lapsing;
   _ear.warp = 0;

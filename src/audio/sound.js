@@ -217,22 +217,6 @@ export class Sound {
       cicadas:  L(this._cicadas(), this._lp(9000), this.wild),
     };
 
-    /* The tyres letting go: a narrow tone with a wander in it. */
-    const sq = ctx.createOscillator();
-    sq.type = 'triangle';
-    sq.frequency.value = 1050;
-    const wob = ctx.createOscillator();
-    wob.frequency.value = 6.5;
-    const wobDepth = ctx.createGain();
-    wobDepth.gain.value = 45;
-    wob.connect(wobDepth).connect(sq.frequency);
-    const sqF = this._bp(1300, 2.5);
-    const sqG = ctx.createGain();
-    sqG.gain.value = 0;
-    sq.connect(sqF).connect(sqG).connect(this.envLP);
-    sq.start(); wob.start();
-    this.layers.squeal = { src: sq, f: sqF, g: sqG };
-
     this._ready = true;
     this._apply();
 
@@ -465,12 +449,6 @@ export class Sound {
     set(Ly.twigs.g.gain, soft ? 0.5 * clamp01(v / 10) : 0, 0.06);
     Ly.twigs.src.playbackRate.setTargetAtTime(0.5 + Math.min(1.5, v / 12), now, 0.1);
     set(Ly.splash.g.gain, water ? 0.45 * clamp01(v / 6) : 0, 0.06);
-
-    const slide = Math.abs(car.slide || 0);
-    const locked = s.handbrake && Math.abs(car.speed) > 3;
-    const squeal = onRoad ? Math.max(clamp01((slide - 1.8) / 3.5), locked ? 0.5 : 0) : 0;
-    set(Ly.squeal.g.gain, 0.05 * squeal, 0.05);
-    Ly.squeal.src.frequency.setTargetAtTime(950 + 120 * Math.min(1, slide / 6), now, 0.1);
 
     if (air) this._airT += dt;
     else {
