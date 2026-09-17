@@ -97,7 +97,6 @@ class FlatSix extends AudioWorkletProcessor {
     return [
       { name: 'rpm', defaultValue: 0, minValue: 0, maxValue: 9000, automationRate: 'k-rate' },
       { name: 'load', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
-      { name: 'starter', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
     ];
   }
 
@@ -107,7 +106,6 @@ class FlatSix extends AudioWorkletProcessor {
     this.slot = 0;           // which of the six firings is next
     this.rpm = 0;
     this.load = 0;
-    this.starter = 0;
     this.boost = 0;
     this.bov = 0;
     this.lastLoad = 0;
@@ -125,7 +123,6 @@ class FlatSix extends AudioWorkletProcessor {
     this.dcX = 0; this.dcY = 0;
     this.firingEnv = 0;
     this.whistle = 0;
-    this.starterPh = 0;
     this.seed = 22222;
   }
 
@@ -147,7 +144,6 @@ class FlatSix extends AudioWorkletProcessor {
 
     const rpm0 = this.rpm, rpm1 = params.rpm[0];
     const load0 = this.load, load1 = params.load[0];
-    const st0 = this.starter, st1 = params.starter[0];
 
     /* Once a block: the filters and the slow state. */
     const load = load1, rpm = rpm1;
@@ -171,7 +167,6 @@ class FlatSix extends AudioWorkletProcessor {
       const f = k / n;
       const r = rpm0 + (rpm1 - rpm0) * f;
       const ld = load0 + (load1 - load0) * f;
-      const st = st0 + (st1 - st0) * f;
 
       /* The crank. */
       const cps = r / 120;                   // cycles per second
@@ -230,15 +225,6 @@ class FlatSix extends AudioWorkletProcessor {
       v += this.hiss.run(white) * this.bov * 0.35;
       v += this.mech.run(white) * 0.012 * Math.min(1, r / 6000);
 
-      /* The starter: a geared whirr with the compression strokes in it. */
-      if (st > 0.001) {
-        this.starterPh += TAU * 160 / sr;
-        if (this.starterPh > TAU) this.starterPh -= TAU;
-        const comp = 0.6 + 0.4 * Math.sin(this.phase * TAU * 3);
-        v += st * comp * (0.12 * Math.sin(this.starterPh) + 0.05 * Math.sin(this.starterPh * 7.1)
-          + 0.03 * white);
-      }
-
       /* DC block, then a soft ceiling. */
       const y = v - this.dcX + 0.995 * this.dcY;
       this.dcX = v; this.dcY = y;
@@ -246,7 +232,7 @@ class FlatSix extends AudioWorkletProcessor {
     }
 
     for (let c = 1; c < out.length; c++) out[c].set(L);
-    this.rpm = rpm1; this.load = load1; this.starter = st1;
+    this.rpm = rpm1; this.load = load1;
     return true;
   }
 }

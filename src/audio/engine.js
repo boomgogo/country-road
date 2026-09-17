@@ -43,7 +43,6 @@ export class EngineModel {
     this.gear = 1;
     this.rpm = 0;
     this.load = 0;
-    this.starter = 0;
     /** Seconds since the last shift; the box will not hunt. */
     this._since = 1;
     /** Counts down through a shift: the torque is cut and the revs swing. */
@@ -58,7 +57,7 @@ export class EngineModel {
     this._lastThrottle = 0;
   }
 
-  /** Turn the key.  The starter, the catch, the flare and the settle. */
+  /** Turn the key.  The crank, the catch, the flare and the settle. */
   ignite() {
     this._running = false;
     this._crank = 0;
@@ -69,7 +68,6 @@ export class EngineModel {
   run() {
     this._running = true;
     this._crank = -1;
-    this.starter = 0;
     if (this.rpm < IDLE) this.rpm = IDLE;
   }
 
@@ -177,18 +175,15 @@ export class EngineModel {
     this._crank += dt;
     const t = this._crank;
     if (t < 0.75) {
-      /* On the starter: two hundred-odd rpm and no fire yet. */
-      this.starter = 1;
+      /* Cranking: two hundred-odd rpm and no fire yet. */
       this.rpm = 210 + 40 * Math.sin(t * 40);
       this.load = 0.03;
     } else if (t < 1.05) {
       /* It catches. */
-      this.starter = Math.max(0, 1 - (t - 0.75) / 0.12);
       this.rpm += (2300 - this.rpm) * (1 - Math.exp(-dt / 0.08));
       this.load = 0.7;
     } else if (t < 2.6) {
       /* And settles to a fast idle, then to idle. */
-      this.starter = 0;
       this.rpm += (IDLE - this.rpm) * (1 - Math.exp(-dt / 0.45));
       this.load += (0.12 - this.load) * (1 - Math.exp(-dt / 0.2));
     } else {

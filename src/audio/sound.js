@@ -405,7 +405,6 @@ export class Sound {
       const p = this.engineNode.parameters;
       set(p.get('rpm'), this.engine.rpm, 0.012);
       set(p.get('load'), this.engine.load, 0.02);
-      set(p.get('starter'), this.engine.starter, 0.02);
     }
 
     /* ---- where the ear is ---- */
