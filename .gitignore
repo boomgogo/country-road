@@ -143,3 +143,5 @@ vite.config.ts.timestamp-*
 .vite/
 
 ref/
+# Chrome profile, created in the working directory by ai/perf-bench/cdp.mjs
+chrome-prof/

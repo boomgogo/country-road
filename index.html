@@ -55,9 +55,25 @@
                border-bottom: 1px solid rgba(255,255,255,.45); padding: 0 .2em .10em; }
       .hud-corner i { font-style: normal; font-size: 10px; letter-spacing: .38em;
                       opacity: .72; display: block; padding-top: 5px; }
-      .hud-hint { position: absolute; top: 20px; left: 0; right: 0; margin: 0;
-                  text-align: center; font-size: 11px; letter-spacing: .24em;
-                  opacity: .55; }
+      /* The top stack -- hint, mode, sky, rest -- in flow order inside one
+         positioned column, rather than four blocks each pinned to its own
+         `top`.  Four fixed offsets only line up while every block is
+         exactly one line tall, and the hint is the one that is not: it is
+         a whole keyboard's worth of text centred across the window, so
+         somewhere around 1100 px it wraps, and the second line landed on
+         top of the mode line.  That is `ref/render_issue.png`, which was
+         reported for the banding and had this in it as well.
+
+         The rhythm is carried by a bottom margin on every child instead,
+         so a hidden block takes its gap with it -- which is what `.hud-hint`
+         does on touch -- and a block that grows pushes the rest down
+         rather than being drawn through.  13 + 11 is the 24 px pitch the
+         fixed offsets used to spell out; `left`/`right` rather than
+         padding, so there is a gutter without depending on `box-sizing`. */
+      .hud-stack { position: absolute; top: 20px; left: 24px; right: 24px;
+                   text-align: center; }
+      .hud-stack > * { margin: 0 0 11px; line-height: 13px; }
+      .hud-hint { font-size: 11px; letter-spacing: .24em; opacity: .55; }
       .hud-toast { position: absolute; bottom: 86px; left: 0; right: 0; margin: 0;
                    text-align: center; font-size: 11px; letter-spacing: .30em;
                    opacity: 0; transition: opacity .35s; }
@@ -65,18 +81,14 @@
          seconds and then left the player with a keyboard that did nothing
          and no way to find out why -- which is exactly how "the controls
          are not wired up" gets reported about controls that are. */
-      .hud-mode { position: absolute; top: 44px; left: 0; right: 0; margin: 0;
-                  text-align: center; font-size: 11px; letter-spacing: .30em; }
+      .hud-mode { font-size: 11px; letter-spacing: .30em; }
       /* Time, season and weather.  With a 24-minute day a player who
          cannot see the clock cannot tell a sunset from a bug. */
-      .hud-sky { position: absolute; top: 68px; left: 0; right: 0; margin: 0;
-                 text-align: center; font-size: 10px; letter-spacing: .34em;
-                 opacity: .42; }
+      .hud-sky { font-size: 10px; letter-spacing: .34em; opacity: .42; }
       /* What Z will do, and how far through it we are.  Sits under the
          sky line: it is about the sky, and it is only ever there when
          there is something to rest through. */
-      .hud-rest { position: absolute; top: 92px; left: 0; right: 0; margin: 0;
-                  text-align: center; font-size: 10px; letter-spacing: .30em;
+      .hud-rest { font-size: 10px; letter-spacing: .30em;
                   opacity: 0; transition: opacity .5s ease; }
       .hud-rest b { font-weight: 400; }
       .hud-rest b:not(:empty)::before { content: 'Z  '; opacity: .55; }
@@ -134,10 +146,14 @@
       /* Which leaves the whole top of the screen to the stack.  It starts
          below the button strip, because it is centred across the full
          width and the strip is not. */
+      /* 13 + 9 is the stack's 22 px pitch here, which is what puts the mode
+         line at 48, the sky at 70, the rest at 92 and `.hud-cam` -- still
+         positioned on its own, because on a desktop it is at the bottom of
+         the frame -- at the 114 below. */
       body.touch .hud-hint { display: none; }
-      body.touch .hud-mode { top: calc(48px + env(safe-area-inset-top)); font-size: 10px; }
-      body.touch .hud-sky { top: calc(70px + env(safe-area-inset-top)); }
-      body.touch .hud-rest { top: calc(92px + env(safe-area-inset-top)); }
+      body.touch .hud-stack { top: calc(48px + env(safe-area-inset-top)); }
+      body.touch .hud-stack > * { margin-bottom: 9px; }
+      body.touch .hud-mode { font-size: 10px; }
       /* The camera readout leaves the bottom edge, where the pedals now
          are, and joins the stack it belongs to.  It is the *state* of a
          gesture -- see `core/pointer.js` -- so it cannot become a toast. */

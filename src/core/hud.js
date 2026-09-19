@@ -48,10 +48,12 @@ export class Hud {
     this.el.innerHTML = `
       <div class="hud-corner hud-left"><b class="hud-n" id="hud-dist">0.0</b><i>miles</i></div>
       <div class="hud-corner hud-right"><b class="hud-n" id="hud-spd">0</b><i>mph</i></div>
-      <p class="hud-hint" id="hud-hint"></p>
-      <p class="hud-mode" id="hud-mode"></p>
-      <p class="hud-sky" id="hud-sky"></p>
-      <p class="hud-rest" id="hud-rest"><b id="hud-rest-label"></b><i id="hud-rest-bar"></i></p>
+      <div class="hud-stack">
+        <p class="hud-hint" id="hud-hint"></p>
+        <p class="hud-mode" id="hud-mode"></p>
+        <p class="hud-sky" id="hud-sky"></p>
+        <p class="hud-rest" id="hud-rest"><b id="hud-rest-label"></b><i id="hud-rest-bar"></i></p>
+      </div>
       <p class="hud-cam" id="hud-cam"></p>
       <p class="hud-toast" id="hud-toast"></p>
       <p class="hud-focus" id="hud-focus">click to drive</p>`;

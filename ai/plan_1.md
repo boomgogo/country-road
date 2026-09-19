@@ -1,9 +1,15 @@
 # plan_1 — the Surface Go rendering artefact
 
 Answers `prompt_1.md`: a rendering issue in one quality setting on a Surface Go
-tablet, `ref/render_issue.png`. Both questions are now answered — it reproduces,
-and the cause is a single line in `core/post.js`. Nothing in `src/` has been
-changed.
+tablet, `ref/render_issue.png`. It reproduces, the cause was one tap distance in
+`core/post.js`, and it is fixed. Sections 1–4 are the diagnosis, §5 the fix as
+applied, §6 a second bug that was in the same screenshot, §7 what the fix
+measures at.
+
+**Landed:** `src/core/post.js` (the tap rounding), `index.html` +
+`src/core/hud.js` (the HUD stack), `ai/perf-bench/ink.mjs` (the regression
+test), `.gitignore` (`chrome-prof/`, which `cdp.mjs` drops in the working
+directory).
 
 ---
 
@@ -156,35 +162,36 @@ not 1.0.
 
 ---
 
-## 5. The fix
+## 5. The fix, as applied
 
 The ink's tap distance is in texels of a texture that cannot be filtered, so it
 has to be a whole number of texels. A fractional tap is not a thinner line — it
 is the same line with the tap snapped, and at a half-integer it is a coin toss
 per column.
 
-**F1 — round the tap, in the shader, so no caller can reintroduce it.**
+The rounding went in the **shader**, not in `setSize`, so no caller can
+reintroduce it — `setNight` already writes four of this uniform's neighbours:
 
 ```glsl
 vec2 t = uTexel * max( 1.0, floor( uThickness + 0.5 ) );
 ```
 
-and keep `post.js` honest about what the uniform now means (whole texels), with
-the comment saying why. One line each, and it closes the whole class: any
-`uThickness` any tier or the governor produces is then safe.
+`floor( x + 0.5 )` rather than `round()`: these shaders compile as GLSL ES 1.00,
+which has no `round()`. `max( 1.0, … )` keeps at least one texel, so a very small
+render scale cannot collapse the stencil onto the centre tap and switch the ink
+off. `setSize` still writes `1.0 + 0.5 * scale` and its comment now says what
+that really chooses: one texel below a render scale of 1, two at or above it.
 
-Rounding in `post.js` alone (`Math.round(1.0 + 0.5 * scale)`) also works and is
-smaller, but leaves the shader still willing to misbehave if anything ever writes
-the uniform directly — `setNight` already writes four of its neighbours.
+One trap worth recording, because it cost a run: that comment lives inside a
+template literal, so a backtick in it ends the literal. `cloudfield.js` has the
+same warning on its own GLSL block. The comment is written without them.
 
-**What it costs.** Thickness becomes 1 or 2 rather than 1.3 – 1.9, so the line
-weight steps instead of sliding, and `uSens`, `uConcave` and `uSlope` were tuned
-against the sliding value. The ink wants a look at each tier after the change —
-`ai/perf-bench/` can capture the three tiers at a fixed frame for a side-by-side.
-It costs nothing in frame time: it is the same four taps.
+**What it costs.** The line weight steps between one texel and two instead of
+sliding. That is not a regression — a NEAREST fetch was always doing it, it just
+used to do it per column. Frame time is unchanged: the same four taps.
 
-**Not worth doing:** special-casing 1.5, or nudging the scale off 1.0. Both leave
-the bug in place and hide it.
+**Not worth doing:** special-casing 1.5, or nudging the scale off 1.0. Both
+leave the bug in place and hide it.
 
 ---
 
@@ -196,30 +203,77 @@ overlaps the mode line.** `index.html` puts `.hud-hint` at `top: 20px` and
 lines and the second lands on `parked — W to drive F for autodrive`, which is
 exactly what the screenshot shows.
 
-Fix: one absolutely positioned column at `top: 20px` holding hint, mode, sky and
-rest in flow order, rather than four fixed offsets. Check at 900, 1108 and
-1440 px wide.
+Fixed by putting hint, mode, sky and rest in flow order inside one positioned
+column (`.hud-stack`), instead of four blocks each pinned to its own `top`. The
+rhythm is a bottom margin on every child rather than four absolute offsets, so a
+hidden block takes its gap with it — which is what `.hud-hint` does on touch —
+and a block that grows pushes the rest down instead of being drawn through.
+`left`/`right` rather than padding gives a 24 px gutter without depending on
+`box-sizing`. `.hud-cam` keeps its own positioning: on a desktop it is at the
+bottom of the frame, not in this stack.
+
+Measured (DOM rects, `?rec=1` with `clean(false)`):
+
+| width | hint | mode | sky | rest | cam | overlaps |
+|---|---|---|---|---|---|---|
+| 1440 | 20 (1 line) | 44 | 68 | 92 | bottom | none |
+| 1108 | 20 (2 lines) | 57 | 81 | 105 | bottom | none |
+| 900 | 20 (2 lines) | 57 | 81 | 105 | bottom | none |
+| touch | hidden | 48 | 70 | 92 | 114 | none |
+
+The 1440 and touch rows are the old layout to the pixel; 1108 is the one that
+used to collide. `scrollWidth === clientWidth` at 760, 900, 1108, 1440 and
+1920 — the hint wraps inside the gutter now rather than running off both edges,
+which it also did in the screenshot.
 
 ---
 
-## 7. Verification
+## 7. What it measures at
 
-- The reproducing frame scores below 0.05 at `medium` after the fix, and the
-  three tiers are visually compared at a fixed frame for line weight.
-- The scan (24 positions over 12 km) scores clean at all three tiers; before the
-  fix `medium` hit 0.05+ at six of the 24 and peaked at 0.194.
-- 3840 x 2160 at `high` scores clean.
-- The whole governor ladder is swept for each tier, not just the starting scale —
-  that is what case 2 in §4 is.
-- Frame rate unchanged against `ai/perf_findings.md` (it should be exactly
-  unchanged; the pass does the same work).
+`HEADLESS=1 node ai/perf-bench/ink.mjs`, against a dev server on 5178:
+
+| case | scale | before | after |
+|---|---|---|---|
+| `medium` | 1.0 | **0.194** | 0.028 |
+| `high` | 1.5 | -0.002 | -0.002 |
+| `low` | 1.25 | 0.006 | 0.006 |
+| `high` at the governor's floor | 1.0 | **0.176** | 0.026 |
+| `high` at 3840 x 2160 | 1.0 | **0.080** | -0.003 |
+
+Threshold 0.09; clean has never measured past 0.05, the reference frame is 0.312.
+
+`SWEEP=1` walks `uThickness` and is the diagnostic rather than the test. It is
+now a step function — 0.004 for a one-texel stencil, 0.028 for two, 0.045 for
+three — with no spike at 1.5 or 2.5. Before the fix those two stood at 0.194 and
+0.065 above flat neighbours, which is the shape of a tie and not of a threshold
+being grazed.
+
+Also checked: `npm run build` succeeds, and the ink still draws — the fence, the
+ridge silhouettes and the road edges are all present in the after-frames
+(`SHOTS=<dir>` dumps them).
+
+Still worth doing and not done here: a look at the three tiers side by side for
+line weight, since `uSens`, `uConcave` and `uSlope` were tuned against a sliding
+thickness rather than a stepping one.
 
 ## 8. Harness
 
-The reproduction is currently in the session scratchpad, not in the repo:
-`repro.mjs` (single capture), `scan.mjs` (walk the road, score, dump hits),
-`sweep.mjs` / `thick.mjs` (scale and thickness sweeps), `bisect.mjs` (hide each
-scene child in turn), `battery.mjs` (the toggle table in §2), and `scorer.js`
-(the detector, in-page). They import `ai/perf-bench/cdp.mjs` and want the dev
-server on 5178. Worth moving into `ai/perf-bench/` if this is to be regression-
-tested; say the word.
+`ai/perf-bench/ink.mjs`, self-contained apart from `cdp.mjs`, wants the dev
+server on 5178.
+
+```
+npx vite --port 5178
+HEADLESS=1 node ai/perf-bench/ink.mjs                  # pass/fail, exit code
+HEADLESS=1 SWEEP=1 node ai/perf-bench/ink.mjs          # the thickness sweep
+HEADLESS=1 SHOTS=/tmp/ink node ai/perf-bench/ink.mjs   # and the frames
+```
+
+The detector is in the file: after a horizontal high-pass, a row of the image
+stays correlated with a row 42 px above it, which grass, trees, shadows and noise
+all do not. `cdp.mjs` drops a `chrome-prof/` in the working directory, now
+ignored.
+
+The rest of the diagnosis — the road scan, the scale sweep, the scene-graph
+bisection and the toggle table — was throwaway and is not in the repo. `ink.mjs`
+is the part worth keeping; the others are reconstructible from §2 if another
+artefact of this shape turns up.

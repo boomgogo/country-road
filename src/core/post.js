@@ -97,7 +97,39 @@ const LOOK = {
 
     /* ---- the ink: screen-space line work from the depth buffer ---- */
     vec3 ink( vec3 col ) {
-      vec2 t = uTexel * uThickness;
+      /* **Whole texels, and the rounding belongs here rather than in
+       * setSize.**  (No backticks in this comment: it is inside a template
+       * literal, and one would end it.  See cloudfield.js, same trap.)
+       *
+       * tDepth is NEAREST on both axes, so a fractional tap does not draw a
+       * finer line -- it draws the same line with the fetch snapped.  At
+       * *half* a texel it does something worse: a fragment centre is at
+       * ( i + 0.5 ) / rw, so a tap of 1.5 texels lands at ( i + 2.0 ) / rw,
+       * exactly on the boundary between two texels, and which side the
+       * float sum falls on flips with the column.  The second difference
+       * below is then taken one texel wide here and two texels wide there,
+       * and on ground seen edge-on -- where the depth gradient is steep
+       * enough for one texel to matter -- that crosses uSens and inks it.
+       * The frame comes out under a grid of dark bars and rungs, vertical
+       * from the x tap and horizontal from the y.  See ai/plan_1.md: a
+       * sweep of this uniform is flat everywhere except a spike at 1.5 and
+       * a smaller one at 2.5, which is the shape of a tie and not of a
+       * threshold being grazed.
+       *
+       * setSize writes 1.0 + 0.5 * scale, which is exactly 1.5 at a render
+       * scale of exactly 1 -- where the medium tier starts, where the high
+       * tier's governor bottoms out, and where scaleFor's pixel budget puts
+       * any tier on a window past about four megapixels.  Rounding here
+       * covers all three, and covers setNight and anything else that ever
+       * writes the uniform directly.
+       *
+       * The cost is that the line weight steps between one texel and two
+       * instead of sliding.  That is not a regression, it is what a NEAREST
+       * fetch was always doing; it just used to do it per column.
+       *
+       * floor( x + 0.5 ) and not round(): these shaders compile as GLSL ES
+       * 1.00, which has no round(). */
+      vec2 t = uTexel * max( 1.0, floor( uThickness + 0.5 ) );
       float dc = linearDepth( vUv );
 
       if ( dc > uSkyDepth ) return col;
@@ -343,7 +375,11 @@ export class Pipeline {
     this.fxaa.mat.uniforms.uTexel.value.copy(texel);
     look.uNear.value = this.camera.near;
     look.uFar.value = this.camera.far;
-    // scale ink weight with resolution so lines stay ~2 device px
+    /* Scale the ink weight with resolution so lines stay ~2 device px.
+     * The shader rounds this to whole texels before it taps -- it has to,
+     * `tDepth` cannot be filtered -- so what this really chooses is one
+     * texel below a render scale of 1 and two at or above it.  See `ink()`
+     * for what a half-texel tap did before the rounding was there. */
     look.uThickness.value = 1.0 + 0.5 * scale;
   }
 
