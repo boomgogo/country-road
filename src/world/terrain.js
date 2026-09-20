@@ -36,17 +36,66 @@ const FILL_BATTER = 2.0;
 /**
  * Rounding at the crest of a cut and the toe of a fill.
  *
- * `gap` is how far the batter still is from natural ground and `over` how
- * far out from the platform edge we are; the result eases the last metre
- * or two of the join.  Without it the earthwork meets the hillside along a
- * mathematically exact crease, which reads as a fold in paper rather than
- * as ground.
+ * `gap` is how far the batter still is from natural ground -- positive
+ * inside the earthwork, negative once the face has passed through the
+ * hillside.  The result is what to add to the face: zero deep inside, the
+ * whole of `gap` once we are clear, and a parabola in between.  Without it
+ * the earthwork meets the hillside along a mathematically exact crease,
+ * which reads as a fold in paper rather than as ground -- and which the
+ * ink pass draws, because a crease is exactly what it looks for.
+ *
+ * **This replaces a rounding that had two faults and drew three lines.**
+ * What was here was `0.5 * min(gap, ROUNDING * min(1, over / 6))`:
+ *
+ *  - It was keyed on `over` as well as `gap`, and the `over` ramp is a
+ *    slope of 0.25 that switches on at the platform edge and off six
+ *    metres later.  That is two slope breaks of a quarter -- one of them
+ *    exactly on top of the hinge, where it cancelled the fillet `batter()`
+ *    had just put there, and one six metres out in the grass, which is the
+ *    line still running along the verge after the first two creases were
+ *    dealt with.  Measured on the cross-section at s = 10520: breaks of
+ *    0.15 at the hinge and 0.17 at over = 6, against 0.028 for the
+ *    fillet's own curvature.
+ *  - And `min(gap, 3) * 0.5` is nonzero for *every* gap, so it lifted the
+ *    whole cut face by up to a metre and a half rather than easing its
+ *    crest.  The batter was never the batter it said it was.
+ *
+ * The parabola below is C1 at both ends by construction and touches
+ * neither fault: it is exactly zero once the face is `k` below natural
+ * ground, exactly `gap` once it is `k` above, and its curvature in ground
+ * terms is `m^2 / (2k)` where `m` is how fast the two surfaces are
+ * closing -- about 0.06 per metre against a cut face on gentle ground,
+ * which is under the knee the ink starts drawing at.  The cost is that
+ * the crest is rounded off by `k / 4`, half a metre, which is what a
+ * rounded crest is.
+ *
+ * **`k` still has to grow from nothing at the platform edge**, and that is
+ * the one thing the old `over` ramp was right about.  A blend of scale `k`
+ * pulls the surface `k / 4` off natural ground wherever the two are within
+ * `k` of each other -- *including where they are merely close and never
+ * cross* -- and the cut branch pulls it down while the fill branch pulls
+ * it up.  At the platform edge, where the batter has no height yet and
+ * which branch we are in is decided by a coin toss between `h` and `edge`,
+ * that is a step of `k / 2` running the length of the road: breaks of 0.8
+ * at s = 2500, worse than the crease it replaced.
+ *
+ * So `k` is ramped over twice the hinge, which keeps it under the batter's
+ * own height everywhere -- `k <= batter(over)` for both slopes, checked
+ * along the whole ramp -- and therefore keeps the branch change inside the
+ * region where both branches return natural ground.  A smoothstep and not
+ * a line, because the ramp's own slope lands in the answer at a quarter of
+ * its value, and `0.25 / 4` is exactly the crease the old one drew.
  */
-function round(gap, over) {
-  const r = Math.min(gap, ROUNDING * Math.min(1, over / (ROUNDING * 2)));
-  return r > 0 ? r * 0.5 : 0;
+const DAYLIGHT = 2.0;
+/** How much more of it a toe gets than a crest.  See `heightAt`. */
+const FILL_ROUND = 2.2;
+
+function round(gap, k) {
+  if (gap >= k) return 0;
+  if (gap <= -k) return gap;
+  const u = gap - k;
+  return -(u * u) / (4 * k);
 }
-const ROUNDING = 3;
 
 /**
  * Over how many metres the earthwork is eased back to natural ground at
@@ -114,13 +163,6 @@ export const ROAD_QUERY = 26;
 export const ROAD_OFF = 30;
 
 /**
- * The crown.  A road sheds water because its middle is a few centimetres
- * higher than its edges, and while three centimetres sounds like nothing
- * it is the difference between a road and a painted stripe -- it catches
- * the light differently on each side of the centre line all the way to
- * the horizon.
- */
-/**
  * Half-width of the built platform -- the flat ground the road is laid on,
  * before the batter starts falling away.
  *
@@ -137,10 +179,86 @@ function platform(q) {
   return CARRIAGEWAY + SHOULDER + 0.9 + ga;
 }
 
-function crown(d) {
-  if (d >= CARRIAGEWAY) return -0.16;
-  const t = d / CARRIAGEWAY;
-  return 0.035 * (1 - t * t) - 0.16 * Math.max(0, (t - 0.78) / 0.22) ** 2;
+/**
+ * The crown, and the shoulder fall -- the road's own cross-section, as
+ * metres above the midline's elevation.
+ *
+ * **The crown.**  A road sheds water because its middle is a few
+ * centimetres higher than its edges, and while three centimetres sounds
+ * like nothing it is the difference between a road and a painted stripe --
+ * it catches the light differently on each side of the centre line all the
+ * way to the horizon.
+ *
+ * **The fall**, and this is the half that had to be rewritten.  The
+ * carriageway sits 16 cm above the verge beside it, and that drop used to
+ * be spent over the last 95 cm of tarmac: a quadratic reaching a slope of
+ * 0.35 at `CARRIAGEWAY` and then flat.  A slope break is a step in the
+ * first difference of depth, which is precisely what the ink in
+ * `core/post.js` fires on -- and because the ground is a *lattice*, a
+ * crease reaches the screen as one small crease per vertex row, so it drew
+ * not as a line but as a broken band of dashes following the road the
+ * whole way to the horizon.  That is the first half of `prompt_2.md`.
+ *
+ * What the ink actually cares about is **curvature**, not slope
+ * continuity: the second difference is the curvature times the square of
+ * the tap's footprint, and on a 1 m lattice it is the slope break per
+ * vertex row, which is the curvature times a metre.  Merely landing the
+ * old quadratic at zero slope is worth almost nothing (2.203 -> 2.140 on
+ * the verge score in `ai/plan_2.md` s2); spending the same drop over more
+ * ground is worth all of it.
+ *
+ * So the fall now runs from 0.78 of the carriageway out to **the platform
+ * edge**, as a smoothstep: about 3.2 to 4.2 m of ground rather than 0.95,
+ * which is a peak curvature of 0.08 per metre against the knee at about
+ * 0.2.  Ending it at `w` rather than at a constant is what keeps it in
+ * step with `platform()` -- the fall finishes exactly where the batter
+ * begins, both with zero slope, so there is no second crease where they
+ * meet and no second number to keep in agreement.
+ *
+ * The tarmac is flatter for it: the drop at the white line is about 3 cm
+ * rather than 16, and the rest happens on the gravel.  That is what a road
+ * with a shoulder does, and the *drawn* edge does not move -- the tarmac
+ * mask in `groundmat.js` is keyed on distance and is deliberately hard.
+ */
+const FALL = 0.16;
+const FALL_START = 0.78 * CARRIAGEWAY;
+
+function crown(d, w) {
+  const t = Math.min(1, d / CARRIAGEWAY);
+  return 0.035 * (1 - t * t)
+    - FALL * smoothstep01((d - FALL_START) / (w - FALL_START));
+}
+
+/**
+ * Rounding at the top of the batter, where it leaves the platform.
+ *
+ * The other crease `prompt_2.md` is about, and the bigger of the two: the
+ * ground is flat out to `w` and then falls or rises at 1:2 or 1:1.5, which
+ * is a slope break of 0.5 to 0.67 at a single lattice row.  It drew as
+ * long diagonal strokes climbing the cutting, along the triangulation's
+ * own diagonals -- which is the tell that the mark is geometry and not the
+ * ink pass misbehaving.
+ *
+ * A parabolic fillet: value and slope continuous at both ends, constant
+ * curvature `1 / (HINGE * ratio)` in between -- 0.11 per metre in cutting
+ * and 0.08 in fill at six metres, under the knee with margin.  Past six it
+ * stops paying for itself (2.140 at 6 m against 2.138 at 12).
+ *
+ * What it costs is that the crest of a cut and the toe of a fill move out
+ * by half the fillet, three metres, and the earthwork carries about that
+ * much less material.  `round()` eases the *other* end of the batter,
+ * where it daylights into the hillside, and the two blends are keyed on
+ * different things -- this one on distance out from the platform, that one
+ * on how far the face still is from natural ground -- so on an earthwork
+ * too shallow to have room for both they simply overlap, which is a
+ * shallower face still and not a crease.
+ */
+const HINGE = 6;
+
+function batter(over, ratio) {
+  return over < HINGE
+    ? (over * over) / (2 * HINGE * ratio)
+    : (over - HINGE * 0.5) / ratio;
 }
 
 export class Terrain {
@@ -206,8 +324,11 @@ export class Terrain {
    * A real earthwork has a *slope*, and its width is whatever that slope
    * needs to reach natural ground:
    *
-   *     in cutting      ground = min(natural, edge + (d - w) / CUT_BATTER)
-   *     on embankment   ground = max(natural, edge - (d - w) / FILL_BATTER)
+   *     in cutting      ground = min(natural, edge + batter(d - w, CUT))
+   *     on embankment   ground = max(natural, edge - batter(d - w, FILL))
+   *
+   * -- where `batter` is `over / ratio` with the first six metres of it
+   * rounded into the platform, for the reason that function gives.
    *
    * The `min`/`max` finds the daylight line by itself -- no band, no
    * parameter, no smoothstep -- and both of the properties the brief asks
@@ -227,24 +348,50 @@ export class Terrain {
     if (!q) return h;
 
     const w = platform(q);
-    const road = q.y + crown(q.d);
+    const road = q.y + crown(q.d, w);
     if (q.d < w) return road;
 
-    const edge = q.y + crown(w);
+    /* The fall has run its course by `w` -- that is what `crown` ends it
+     * there for -- so the batter starts from the bottom of it, flat. */
+    const edge = q.y + crown(w, w);
     const over = q.d - w;
+
+    /* How much rounding the crest is allowed here.  See `round`: it has to
+     * stay under the batter's own height or the two branches below part
+     * company at the platform edge. */
+    const k = DAYLIGHT * smoothstep01(over / (2 * HINGE));
 
     let y;
     if (h > edge) {
       /* Cutting: the hillside is above the carriageway, so it is cut back
        * at 1:CUT_BATTER until it meets itself. */
-      const face = edge + over / CUT_BATTER;
-      if (face >= h) return h;                      // daylighted already
-      y = face + round(h - face, over);
+      const face = edge + batter(over, CUT_BATTER);
+      const gap = h - face;
+      if (gap <= -k) return h;                      // daylighted and clear
+      y = face + round(gap, k);
     } else {
       /* Embankment: the ground falls away, so it is built up at 1:FILL. */
-      const face = edge - over / FILL_BATTER;
-      if (face <= h) return h;
-      y = face - round(face - h, over);
+      const face = edge - batter(over, FILL_BATTER);
+      const gap = face - h;
+      /* **And the toe gets more of it than the crest does.**
+       *
+       * The blend's curvature is `m^2 / 2k`, where `m` is how fast the two
+       * surfaces are closing -- and on ground falling away from the road
+       * `m` is the fill slope *plus* the hillside's, where in a cutting it
+       * is the cut slope *minus* it.  So the same `k` buys a much tighter
+       * blend at a toe than at a crest, and the embankments came out with
+       * a hard line along the foot of the fill where the cuttings came out
+       * clean: the verge probe went 6.3 to 2.6 on a cutting and 9.9 to
+       * 12.6 on an embankment, which is the wrong direction and is the
+       * only case in this iteration that got worse before this line.
+       *
+       * The toe of an embankment is also the place a real one is most
+       * rounded -- it is loose material at its angle of repose meeting a
+       * field -- so widening it is not a cheat, and it is what FILL_BATTER
+       * is already saying one line up. */
+      const kf = k * FILL_ROUND;
+      if (gap <= -kf) return h;
+      y = face - round(gap, kf);
     }
 
     /* --- and out, before the road stops being asked about ---------------

@@ -23,6 +23,7 @@ import { Clock, DAY, YEAR, HOUR, MINUTE, sunAltAt } from './world/clock.js';
 import { TimeLapse, nextFirstLight } from './world/timelapse.js';
 import { CloudField } from './world/cloudfield.js';
 import { Clouds } from './world/clouds.js';
+import { CloudGeo } from './world/cloudgeo.js';
 import { Atmosphere } from './world/atmosphere.js';
 import { Celestial } from './world/celestial.js';
 import { Weather } from './world/weather.js';
@@ -364,22 +365,38 @@ const sky = new Sky(scene, VIEW * 1.12);   // inside camera.far, deliberately
  * `?maxstep=N` overrides the march's longest stride, which `plan_9` cut
  * from 450 to 150 to take the horizontal layering off far cloud.
  * `?maxstep=450` is that layering, and unlike `raw` it *is* a still. */
-const CLOUD_MODE = params.get('clouds') || 'on';
-/* One cloud field: the sky marches through it, every lit material takes
- * its shadow from it, and the rain falls out of the thick part of it.
- * Built from the same seed as everything else -- and **before** `Clouds`,
- * which needs the erosion volume it owns. */
+/* **And since `plan_2.md` there are two layers.**
+ *
+ * `geo` is the default: clusters of cel-shaded lobes with the world's own
+ * ink around them (`world/cloudgeo.js`).  `prompt_2.md` asked for a sky
+ * that matches the drawing under it, and a raymarch is a photograph
+ * however good it is.  `?clouds=march` is the volumetric layer above,
+ * which is the better physics and stays reachable; `full` and `raw` are
+ * its two variants and are described in the paragraph above this one. */
+const CLOUD_MODE = params.get('clouds') || 'geo';
+const MARCHING = CLOUD_MODE === 'march' || CLOUD_MODE === 'full'
+  || CLOUD_MODE === 'raw' || CLOUD_MODE === 'on';
+/* One cloud field, whichever layer draws it: the sky reads it, every lit
+ * material takes its shadow from it, and the rain falls out of the thick
+ * part of it.  Built from the same seed as everything else -- and
+ * **before** the layer, which needs the erosion volume it owns. */
 const cloudField = new CloudField(SEED);
 weather.field = cloudField;
 const clouds = CLOUD_MODE === 'off'
   ? null
-  : new Clouds(scene, {
+  : (MARCHING
+    ? new Clouds(scene, {
       scale: CLOUD_MODE === 'full' ? 1 : Q.cloudScale,
       history: CLOUD_MODE === 'full' ? 1 : Q.cloudHistory,
       temporal: CLOUD_MODE !== 'raw',
       maxStep: Number(params.get('maxstep')) || undefined,
       field: cloudField,
-    });
+    })
+    : new CloudGeo(scene, {
+      field: cloudField,
+      clouds: Q.cloudCount,
+      detail: Q.cloudDetail,
+    }));
 sky.set(CEL ? PAL.skyTop : 0xa6c6e2, CEL ? PAL.skyMid : 0xdcebf2, HAZE);
 /* The sun, the moon, five thousand real stars, and the rain.  All four sit
  * inside the dome and outside everything else. */

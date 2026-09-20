@@ -36,6 +36,13 @@ import { FAR_LOD } from '../world/chunks.js';
  * @property {number} shadowMap  shadow map size, texels per side
  * @property {number} cloudScale fraction of the render target the clouds march at
  * @property {number} cloudHistory fraction the cloud history is kept at
+ * @property {number} cloudCount  clusters the drawn layer places at most
+ * @property {number} cloudDetail icosahedron subdivision per cloud lobe.
+ *   1 everywhere so far: the whole layer is 115 000 triangles in one
+ *   instanced draw at `high`, which is not where a phone's trouble is, and
+ *   0 is a visibly different sky -- angular enough to read as crystals
+ *   rather than cloud.  The knob is here for the device that proves that
+ *   wrong.
  * @property {object[]} farLod   see `FAR_LOD`
  */
 
@@ -48,6 +55,7 @@ export const TIERS = {
     scale: 1.75, maxScale: 1.75, minScale: 1,
     anisotropy: 16, shadowMap: 3072,
     cloudScale: 0.5, cloudHistory: 1,
+    cloudCount: 420, cloudDetail: 1,
     farLod: FAR_LOD.high,
   },
   /* Integrated graphics.  No supersample to start with, and the governor
@@ -57,6 +65,7 @@ export const TIERS = {
     scale: 1, maxScale: 1.5, minScale: 0.6,
     anisotropy: 4, shadowMap: 2048,
     cloudScale: 0.3, cloudHistory: 0.5,
+    cloudCount: 300, cloudDetail: 1,
     farLod: FAR_LOD.medium,
   },
   /* Phones.  The scale and the shadow map are what `?quality=low` already
@@ -65,6 +74,7 @@ export const TIERS = {
     scale: 1.25, maxScale: 1.25, minScale: 0.6,
     anisotropy: 2, shadowMap: 1536,
     cloudScale: 0.3, cloudHistory: 0.5,
+    cloudCount: 200, cloudDetail: 1,
     farLod: FAR_LOD.low,
   },
 };
