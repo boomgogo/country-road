@@ -103,7 +103,20 @@ const LOBES = 6;
  * quantile cut, so the fraction of cells that accept is `w.cloud` -- which
  * means the sky fraction comes out right only if an accepted cell's cloud
  * covers about one cell's worth of sky.  `pi * r^2 = cell^2` puts the mean
- * radius at 0.56 of the cell, which is what these two average to.
+ * radius at 0.56 of the cell, and these two average to 0.66 -- because a
+ * cluster is not a disc, and the gap between the two numbers is what
+ * `cover.mjs` is for.
+ *
+ * **They went up by a seventh when the lobes stopped being prolate.**  The
+ * old ones were set against a cluster whose lobes were up to 3.8 times
+ * taller than they were wide, and a tall lobe covers a great deal of sky
+ * when it is seen from underneath at a shallow angle -- which is most of
+ * the upper half of the frame.  Bounding the aspect took `fewClouds` from
+ * 0.137 to 0.097 against `w.cloud` of 0.22; these put it back to 0.124,
+ * with `partly` and `cloudy` landing on the march almost exactly (0.340
+ * against 0.330, 0.485 against 0.480).  Buying the cover back through the
+ * radius rather than through the height is the honest way round: the
+ * cloud is standing in for a cell's worth of *sky*, which is an area.
  *
  * **In proportion, and that is the correction.**  The radius grew as the
  * 0.55 power of the cell to begin with, which is a coverage that falls
@@ -113,8 +126,8 @@ const LOBES = 6;
  * degrees down to the horizon.  Which is most of the sky, and the half an
  * overcast is most obviously an overcast in.
  */
-const RAD_MIN = 0.42;
-const RAD_SPAN = 0.28;
+const RAD_MIN = 0.50;
+const RAD_SPAN = 0.32;
 
 /**
  * The silhouette test's own margin.
@@ -130,78 +143,250 @@ const FULL_AT = 0.16;
 /* ------------------------------------------------------------------ *
  * The cluster.
  *
- * Six lobes on a flattened ellipsoidal envelope, the lower half squashed
- * so the base is nearly flat -- which is the one thing every cumulus in
- * `ref/cloud/` has in common, and the thing a ball of spheres does not
- * have unless it is told to.  The lobes are instances of one icosahedron,
- * so the whole layer is a single draw call and the variety is in the
- * per-instance matrices rather than in the geometry.
+ * A body lobe with five more piled around and above it, sitting on a flat
+ * base -- which is the one thing every cumulus in `ref/cloud/` has in
+ * common, and the thing a ball of spheres does not have unless it is told
+ * to.  Each lobe is a **true ellipsoid, solved in the fragment shader**;
+ * the geometry below it is only a hull to get the fragments started.  See
+ * `LOBE_VERT` for why.
+ *
+ * **Two things were wrong with the first build of this and both show in
+ * `ai/capture/plan_2/sky.png`.**
+ *
+ * The lobes were *prolate* -- taller than wide -- which is the opposite of
+ * what the comment here claimed and of what a cumulus is.  The y scale was
+ * `s * thick * 1.15` against an xz scale of `s * rad`, and `thick` runs to
+ * 650 m where `rad` is 200 to 330, so a lobe came out between 1.4 and 3.8
+ * times taller than it was wide.  A cloud drew as a bunch of vertical
+ * fingers.  The aspect is now **bounded** rather than left to whatever two
+ * unrelated numbers happen to divide to: `vert` below, clamped.
+ *
+ * And the lobes did not reliably *overlap*.  `r` ran to 0.82 of the cloud
+ * radius while a ring lobe's own radius was as little as 0.30 and the body
+ * 0.62, so at the far end of those ranges a lobe was tangent to the body
+ * or clear of it -- and the union of two barely-overlapping spheres has a
+ * deep inward cusp between them, which is a sharp corner that no amount of
+ * tessellation removes.  A ring lobe is now pulled back toward the body
+ * until it is properly inside the union, by `OVERLAP` of its own radius.
  * ------------------------------------------------------------------ */
 
-/** Where lobe `i` of cloud `seed` sits, in units of the cloud's radius. */
+/** The body lobe's radius, as a fraction of the cloud's own. */
+const BODY_S = 0.58;
+/** A ring lobe's, likewise. */
+const RING_S = 0.32, RING_S_SPAN = 0.22;
+/** How far out a ring lobe would like to sit, before the overlap clamp. */
+const RING_R = 0.36, RING_R_SPAN = 0.46;
+/**
+ * How deep every ring lobe cuts into the body, as a fraction of the
+ * smaller of the two radii.  Below about a third the union starts showing
+ * cusps where the two surfaces cross; above about a half the ring lobes
+ * disappear into the body and the cloud goes back to being one ball.
+ */
+const OVERLAP = 0.42;
+/** Lobes are wider than tall.  A cumulus is not a bunch of balloons. */
+const LOBE_SQUASH = 0.86;
+/** How much the lobes near the middle pile up over the ones at the edge. */
+const PILE = 0.55;
+/**
+ * How tall the finished cluster stands, in units of the cloud's radius,
+ * with the widest lobe and the fattest ring -- the top of the tallest lobe
+ * in `lobe`'s own units.  It is what the base shading measures against and
+ * it is arithmetic off the four constants above, not a tuning knob: change
+ * one of them and this is the number that has to move with it.
+ */
+const CLUSTER_H = 1.35;
+/**
+ * And the bounds on the cluster's own vertical stretch.  `VERT_MAX` is the
+ * one that matters: `LOBE_SQUASH * VERT_MAX` is 0.99, so a lobe is never
+ * taller than it is wide however thick the field says the deck is.
+ */
+const VERT_MIN = 0.86, VERT_MAX = 1.15;
+/** How far a lobe may lean, radians, peak to peak.  See `_place`. */
+const TILT = 0.5;
+
+/**
+ * Where lobe `i` of cloud `seed` sits and how big it is, **all four in
+ * units of the cloud's horizontal radius**, with `y` measured up from the
+ * cloud's base and `s` the lobe's horizontal radius.  Its vertical radius
+ * is `s * LOBE_SQUASH`, so a lobe is an oblate spheroid; the caller
+ * stretches the whole cluster vertically by one more factor and that
+ * stretch is an affine map in y, so it takes spheroids to spheroids and
+ * leaves every overlap below exactly as deep as it is here.
+ */
 function lobe(seed, i, out) {
+  /* The body sits at the middle with its bottom on the base.  Without it a
+   * cloud is a wreath, which is what the first build of this was -- six
+   * lobes on a circle and a hole in the middle of every one of them. */
+  const by = BODY_S * LOBE_SQUASH;
+  if (i === 0) {
+    out.x = 0; out.z = 0; out.y = by; out.s = BODY_S;
+    return out;
+  }
+
   const a = hashFloat(seed, i, 11) * Math.PI * 2;
-  const r = 0.30 + 0.52 * hashFloat(seed, i, 12);
-  /* The first lobe is the body and sits at the middle; the rest ring it.
-   * Without the body a cloud is a wreath, which is what the first build of
-   * this was -- six lobes on a circle and a hole in the middle of every
-   * one of them. */
-  const rr = i === 0 ? 0 : r;
-  out.x = Math.cos(a) * rr;
-  out.z = Math.sin(a) * rr * 0.8;
-  /* Higher toward the middle: the tops pile up over the body and the
-   * outliers stay down on the base, which is the cauliflower profile the
-   * march gets out of its height-dependent cut. */
-  out.y = 0.30 + (1 - rr) * 0.34 * hashFloat(seed, i, 13);
-  out.s = (i === 0 ? 0.62 : 0.30 + 0.26 * hashFloat(seed, i, 14));
+  const s = RING_S + RING_S_SPAN * hashFloat(seed, i, 14);
+  const rr = RING_R + RING_R_SPAN * hashFloat(seed, i, 12);
+  let x = Math.cos(a) * rr;
+  let z = Math.sin(a) * rr * 0.8;
+  /* Its own bottom on the base, and then higher toward the middle: the
+   * tops pile up over the body and the outliers stay down, which is the
+   * cauliflower profile the march gets out of its height-dependent cut. */
+  let y = s * LOBE_SQUASH + (1 - rr) * PILE * hashFloat(seed, i, 13);
+
+  /* And in it comes until it is properly inside the union.  The test is in
+   * *round* space -- y unsquashed -- because that is the space the two
+   * spheroids are spheres in, and a sphere test is the only one with a
+   * closed form worth writing. */
+  const dy = (y - by) / LOBE_SQUASH;
+  const len = Math.sqrt(x * x + z * z + dy * dy);
+  const reach = BODY_S + s - OVERLAP * Math.min(BODY_S, s);
+  if (len > reach) {
+    const k = reach / len;
+    x *= k; z *= k; y = by + dy * k * LOBE_SQUASH;
+  }
+
+  out.x = x; out.z = z; out.y = y; out.s = s;
   return out;
 }
 
+/* ------------------------------------------------------------------ *
+ * The lobe, as an ellipsoid the fragment shader solves for.
+ *
+ * **Why, and it is the whole of `prompt_3.md` item 1.**  What was here was
+ * `IcosahedronGeometry(1, 1)` -- eighty triangles, a silhouette that is
+ * about a ten-gon.  Three normalises the vertex normals at any detail
+ * above zero so the *shading* was smooth and the faceting never showed in
+ * the colour; the **outline** is another matter, and the outline is the
+ * one thing this layer exists to draw.  The ink takes a second difference
+ * of depth, so it finds the silhouette exactly where the polygon puts it,
+ * and `ai/capture/plan_2/sky.png` is the result: every cloud edged in
+ * straight segments meeting at corners.  Pointy, which is what the prompt
+ * says.
+ *
+ * There is no subdivision level at which a polygon silhouette is *smooth*.
+ * There is only one at which it is small, and at a cloud two hundred pixels
+ * across that level is expensive.  So the lobe stops being a polygon:
+ * the geometry is a hull that only has to *contain* the ellipsoid, the
+ * fragment shader intersects the view ray with the ellipsoid itself, and
+ * position, normal and depth all come out exact.  The silhouette is then a
+ * conic section at every distance and every screen size, for free, and the
+ * ink has a smooth curve to trace.
+ *
+ * What it costs is early-Z: a shader that writes `gl_FragDepthEXT` cannot
+ * be rejected before it runs, and the lobes overlap heavily.  That is what
+ * the hull is for -- `proxyGeometry` blows an icosahedron up by just
+ * enough to enclose the unit sphere and no more, so the fragments the
+ * shader throws away are the corners of a circle in a polygon rather than
+ * the corners of a circle in a screen-space square, which is what a
+ * billboard would have cost.
+ *
+ * `gl_FragDepthEXT` and not `gl_FragDepth`: three compiles every
+ * ShaderMaterial as `#version 300 es` and defines the one to the other, so
+ * this is the spelling that works whichever way the material is declared.
+ * It assumes the ordinary depth range -- `main.js` does not ask for a
+ * reversed buffer.
+ *
+ * No backticks below this line; see the file header.
+ * ------------------------------------------------------------------ */
+
 const LOBE_VERT = /* glsl */ `
-  attribute vec3 aCentre;      // the cloud's own centre, world metres
+  attribute vec2 aCloud;       // the cluster's middle height, and 1 / its half-height
   attribute float aFade;       // 0 at the range boundary, 1 up close
-  varying vec3 vNormal;
-  varying vec3 vView;
-  varying float vDist;
-  varying float vFade;
-  varying float vUp;
+  varying vec3 vOrigin;        // the eye, in the lobe's unit-sphere space
+  varying vec3 vDir;           // the view ray, likewise
+  varying vec4 vRel;           // xyz: hull point - eye, world.  w: aFade
+  varying mat3 vRot;           // unit-sphere space -> world, rotation only
+  varying vec3 vScl;           // the lobe's three radii, world metres
+  varying vec2 vCloud;         // aCloud, straight through
 
   void main() {
+    /* The instance matrix is compose( position, quaternion, scale ) with a
+     * non-uniform scale, so its upper 3x3 is R * S with S diagonal.  That
+     * factorisation is the only reason any of this is cheap: the inverse
+     * is S^-1 * R^T, which is three dot products and a divide, and no
+     * general 3x3 inverse is ever formed. */
+    mat3 W = mat3( modelMatrix ) * mat3( instanceMatrix );
+    vec3 sc = vec3( length( W[ 0 ] ), length( W[ 1 ] ), length( W[ 2 ] ) );
+    mat3 R = mat3( W[ 0 ] / sc.x, W[ 1 ] / sc.y, W[ 2 ] / sc.z );
+
     vec4 wp = modelMatrix * instanceMatrix * vec4( position, 1.0 );
-    /* The lobes are squashed -- wider than tall -- so the instance matrix
-     * has a non-uniform scale in it and its upper 3x3 is not a rotation.
-     * Dividing by the squared column lengths is the inverse transpose
-     * without building one: for T * R * S with S diagonal, that is all it
-     * is.  Without it every base shades as though it were a sphere and
-     * the flattening does not read at all. */
-    vec3 sc = vec3( length( instanceMatrix[ 0 ].xyz ),
-                    length( instanceMatrix[ 1 ].xyz ),
-                    length( instanceMatrix[ 2 ].xyz ) );
-    vNormal = normalize( mat3( modelMatrix ) * mat3( instanceMatrix )
-                         * ( normal / ( sc * sc ) ) );
-    vec4 mv = viewMatrix * wp;
-    vView = normalize( -mv.xyz );
-    vDist = length( wp.xyz - cameraPosition );
-    vFade = aFade;
-    /* How far up its own cloud this fragment is, for the base shading.
-     * Off the instance rather than off the lobe, so a low lobe is dark all
-     * over rather than dark only at its own bottom. */
-    vUp = clamp( ( wp.y - aCentre.y ) * 0.004 + 0.5, 0.0, 1.0 );
-    gl_Position = projectionMatrix * mv;
+    vec3 ctr = ( modelMatrix * instanceMatrix * vec4( 0.0, 0.0, 0.0, 1.0 ) ).xyz;
+
+    /* R^T * v, written out: R[ i ] is a *column*, so the dots are the
+     * rows of the transpose.  GLSL ES 1.00 has no transpose() and this
+     * shader is written to compile as either version. */
+    vec3 oc = cameraPosition - ctr;
+    vOrigin = vec3( dot( R[ 0 ], oc ), dot( R[ 1 ], oc ), dot( R[ 2 ], oc ) ) / sc;
+
+    vec3 rel = wp.xyz - cameraPosition;
+    /* The ray, in the same space.  It interpolates: the varying arrives at
+     * the fragment as R^T * ( thisFragment - eye ) / sc, because it is a
+     * linear function of the world position and the rasteriser's
+     * interpolation is perspective-correct.  So the same t solves the
+     * quadratic and steps along the world ray, and no ray has to be
+     * rebuilt from gl_FragCoord. */
+    vDir = vec3( dot( R[ 0 ], rel ), dot( R[ 1 ], rel ), dot( R[ 2 ], rel ) ) / sc;
+
+    vRel = vec4( rel, aFade );
+    vRot = R;
+    vScl = sc;
+    vCloud = aCloud;
+    gl_Position = projectionMatrix * viewMatrix * wp;
   }
 `;
 
 const LOBE_FRAG = /* glsl */ `
   uniform vec3 uSunDir, uSunCol, uAmbient, uHaze, uTint, uShadowTint;
   uniform float uNight, uExposure, uHeavy;
-  varying vec3 vNormal;
-  varying vec3 vView;
-  varying float vDist;
-  varying float vFade;
-  varying float vUp;
+  uniform mat4 uProj;
+  varying vec3 vOrigin;
+  varying vec3 vDir;
+  varying vec4 vRel;
+  varying mat3 vRot;
+  varying vec3 vScl;
+  varying vec2 vCloud;
 
   void main() {
-    vec3 n = normalize( vNormal );
+    /* Ray against the unit sphere, which is the lobe with its own scale
+     * and rotation divided out.  The near root is the one that is visible:
+     * the hull is convex and the eye is always outside it -- the deck is
+     * 1150 m up and the nearest cell is 470 m across, so nothing is ever
+     * inside a cloud. */
+    vec3 o = vOrigin;
+    float len = length( vDir );
+    vec3 dn = vDir / len;
+
+    /* **Not b^2 - 4ac.**  The eye is tens of lobe-radii away, so in unit-
+     * sphere units o is around fifty and the discriminant in that form is
+     * the difference of two numbers near 10^7 that agree to six digits --
+     * which is every digit a float has.  It comes out as noise exactly
+     * where it matters, at the limb, where the whole point of this
+     * material is a clean silhouette.
+     *
+     * The perpendicular form cancels *componentwise* instead: o minus its
+     * projection on the ray is a vector of length at most one, built from
+     * components of about fifty, so it keeps five digits rather than
+     * losing them all, and the discriminant is one minus its square. */
+    float B = dot( o, dn );
+    vec3 perp = o - B * dn;
+    float disc = 1.0 - dot( perp, perp );
+    if ( disc < 0.0 ) discard;
+    float tn = -B - sqrt( disc );              // along the unit ray
+    if ( tn <= 0.0 ) discard;
+    float t = tn / len;                        // ... and along the hull's
+
+    vec3 hl = perp + dn * ( -sqrt( disc ) );   // the hit, on the unit sphere
+    vec3 rel = vRel.xyz * t;                   // the hit, from the eye, world
+    vec3 hit = cameraPosition + rel;
+    float dist = length( rel );
+
+    /* The normal of an ellipsoid is *not* the transformed normal of the
+     * sphere: it is ( M^-1 )^T times the sphere's, which for R * S is
+     * R * S^-1.  Getting this wrong shades every base as though it were
+     * round and the flattening does not read at all. */
+    vec3 n = normalize( vRot * ( hl / vScl ) );
+    vec3 view = normalize( -rel );
+
     float ndl = dot( n, uSunDir );
 
     /* The ramp, and it is the *high-key* one -- 168 / 212 / 255 out of
@@ -210,6 +395,11 @@ const LOBE_FRAG = /* glsl */ `
      * three bands goes grey at the first step and a grey cumulus in
      * daylight is a rain cloud. */
     float band = ndl > 0.42 ? 1.0 : ( ndl > -0.08 ? 0.78 : 0.56 );
+
+    /* How far up its own cloud this fragment is, for the base shading.
+     * Off the cluster centre rather than off the lobe, so a low lobe is
+     * dark all over rather than dark only at its own bottom. */
+    float up = clamp( ( hit.y - vCloud.x ) * vCloud.y * 0.5 + 0.5, 0.0, 1.0 );
 
     /* Undersides are darker than shadow sides: a cumulus base is lit by
      * the ground and by whatever gets through the cloud above it, and
@@ -226,7 +416,7 @@ const LOBE_FRAG = /* glsl */ `
      * the same sky as the fair preset, which carries the same cloud
      * fraction and differs only in what is falling out of it. */
     float baseLit = mix( 0.66, 0.34, uHeavy );
-    band *= baseLit + ( 1.0 - baseLit ) * vUp;
+    band *= baseLit + ( 1.0 - baseLit ) * up;
 
     /* The cool shift in the dark band, exactly as shadowTint does it for
      * every lit material in the world: the shadow is a different hue and
@@ -248,20 +438,62 @@ const LOBE_FRAG = /* glsl */ `
      * lands where the sun is behind the cloud and the surface is turning
      * away from the eye.  Without it a backlit cumulus is a flat grey
      * shape, which is the one sky everybody recognises as fake. */
-    float rim = pow( max( 0.0, dot( vView, -uSunDir ) ), 3.0 )
-      * pow( 1.0 - abs( dot( n, vView ) ), 1.6 );
+    float rim = pow( max( 0.0, dot( view, -uSunDir ) ), 3.0 )
+      * pow( 1.0 - abs( dot( n, view ) ), 1.6 );
     col += uSunCol * rim * 0.55 * uExposure;
 
     /* Aerial perspective, by true distance.  The layer's camera is not the
      * world's, so three's fog is no use here and is switched off -- this
      * is the same fade the march does, and it is what lets the blue show
      * through between the far clouds instead of a grey deck. */
-    float haze = smoothstep( ${FADE_FROM.toFixed(1)}, ${FADE_TO.toFixed(1)}, vDist );
+    float haze = smoothstep( ${FADE_FROM.toFixed(1)}, ${FADE_TO.toFixed(1)}, dist );
     col = mix( col, uHaze, haze * 0.94 );
 
-    gl_FragColor = vec4( col, vFade );
+    /* And the depth of the *ellipsoid*, not of the hull -- which is the
+     * whole point, because the ink downstream reads this buffer and
+     * nothing else.  three declares projectionMatrix for the vertex
+     * stage only, so the layer passes its own. */
+    vec4 clip = uProj * viewMatrix * vec4( hit, 1.0 );
+    gl_FragDepthEXT = clamp( clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0 );
+    gl_FragColor = vec4( col, vRel.w );
   }
 `;
+
+/**
+ * A hull that contains the unit sphere, as tightly as `detail` allows.
+ *
+ * An icosahedron's vertices are *on* the sphere, so the solid is inside it
+ * and a hull built from one would clip the lobe's own limb away.  Blowing
+ * it up by the reciprocal of its inradius -- the distance from the centre
+ * to the nearest face plane -- is the smallest scaling that encloses the
+ * sphere, and it is measured off the geometry rather than written down,
+ * so it stays right if `detail` ever changes.
+ *
+ * `detail` is therefore a pure overdraw knob and not a quality one: 0 is
+ * twenty triangles that over-cover the lobe by about 58 % of its area, 1
+ * is eighty that over-cover by about a tenth.  Since the shader writes
+ * depth and cannot be early-Z rejected, the tighter hull is worth its
+ * vertices on every tier tried so far.
+ */
+function proxyGeometry(detail) {
+  const geo = new THREE.IcosahedronGeometry(1, detail);
+  const p = geo.attributes.position;
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  let inradius = Infinity;
+  for (let i = 0; i < p.count; i += 3) {
+    a.fromBufferAttribute(p, i);
+    b.fromBufferAttribute(p, i + 1).sub(a);
+    c.fromBufferAttribute(p, i + 2).sub(a);
+    b.cross(c).normalize();
+    inradius = Math.min(inradius, Math.abs(b.dot(a)));
+  }
+  geo.scale(1 / inradius, 1 / inradius, 1 / inradius);
+  /* Nothing downstream reads either of these -- the normal is solved for
+   * and there is no texture -- and they are half the vertex bandwidth. */
+  geo.deleteAttribute('normal');
+  geo.deleteAttribute('uv');
+  return geo;
+}
 
 /* ------------------------------------------------------------------ *
  * The ink, the cirrus and the rain, in one pass over the layer's target.
@@ -430,8 +662,9 @@ export class CloudGeo {
    *   the only one that matters: the layer draws at the target's own
    *   resolution because the lines want it and because geometry this
    *   cheap can pay for it.
-   * @param {number} o.detail  icosahedron subdivision per lobe: 1 is a
-   *   rounded lump at 80 triangles, 0 is a faceted one at 20.
+   * @param {number} o.detail  subdivision of the *hull* each lobe is
+   *   started from -- an overdraw knob, not a quality one.  The lobe
+   *   itself is an exact ellipsoid at any value.  See `proxyGeometry`.
    */
   constructor(scene, { field = null, clouds = 320, detail = 1 } = {}) {
     this.field = field;
@@ -467,6 +700,10 @@ export class CloudGeo {
         uNight: { value: 0 },
         uExposure: { value: 0.5 },
         uHeavy: { value: 0 },
+        /* The layer's own projection.  three declares `projectionMatrix`
+         * for the vertex stage only, and the ellipsoid's depth is worked
+         * out in the fragment stage.  See `LOBE_FRAG`. */
+        uProj: { value: new THREE.Matrix4() },
       },
       vertexShader: LOBE_VERT,
       fragmentShader: LOBE_FRAG,
@@ -474,14 +711,14 @@ export class CloudGeo {
       fog: false,
     });
 
-    const geo = new THREE.IcosahedronGeometry(1, detail);
+    const geo = proxyGeometry(detail);
     this.mesh = new THREE.InstancedMesh(geo, this.mat, this.max * LOBES);
     this.mesh.frustumCulled = false;
     this.mesh.count = 0;
     const n = this.max * LOBES;
-    this.aCentre = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
+    this.aCloud = new THREE.InstancedBufferAttribute(new Float32Array(n * 2), 2);
     this.aFade = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
-    geo.setAttribute('aCentre', this.aCentre);
+    geo.setAttribute('aCloud', this.aCloud);
     geo.setAttribute('aFade', this.aFade);
     this.scene.add(this.mesh);
 
@@ -650,6 +887,10 @@ export class CloudGeo {
     c.updateProjectionMatrix();
     c.updateMatrixWorld(true);
     s.uInvVP.value.multiplyMatrices(c.projectionMatrix, c.matrixWorldInverse).invert();
+    /* The layer's projection, for the ellipsoid's own depth.  It has to be
+     * written after `updateProjectionMatrix` above and before the render,
+     * which is the whole reason it lives here and not in the constructor. */
+    u.uProj.value.copy(c.projectionMatrix);
 
     this._place(camera.position);
   }
@@ -684,7 +925,7 @@ export class CloudGeo {
     const mix = CLOUD_UNIFORMS.uShapeMix.value;
     const base = CLOUD_UNIFORMS.uCloudBase.value;
     const mat = this.mesh.instanceMatrix.array;
-    const ctr = this.aCentre.array;
+    const ctr = this.aCloud.array;
     const fade = this.aFade.array;
     const cand = this._cand;
     cand.length = 0;
@@ -759,6 +1000,23 @@ export class CloudGeo {
            * the same height. */
           const y = eye.y + base - (q.f1 - 0.5) * 220 - (q.f2 - 0.5) * 160;
           const thick = (TOP - BASE) * (0.38 + 0.62 * smooth01((q.f2 - 0.28) / 0.40));
+          /* How tall this cluster stands, as a multiple of a round one --
+           * and **bounded**, which is the whole of the fix.  What was here
+           * fed `thick` straight into the lobe's y scale against `q.rad`
+           * in x and z, and those two are unrelated numbers: `thick` runs
+           * to 650 m where `rad` is 200 to 330, so the lobes came out up
+           * to 3.8 times taller than wide and a cloud drew as a bunch of
+           * vertical fingers.  The field still decides the aspect -- it is
+           * `thick` divided by the cloud's own width -- it just no longer
+           * decides it without limit. */
+          const vert = Math.min(VERT_MAX, Math.max(VERT_MIN, thick / (q.rad * 1.6)));
+          /* The cluster's middle and its half-height, for the base
+           * shading: a fragment's height within its own cloud has to be
+           * measured against the cloud, or the near ring reads right and
+           * the far ring -- whose clouds are three times the size -- comes
+           * out uniformly pale. */
+          const mid = y + 0.5 * CLUSTER_H * q.rad * vert;
+          const inv = 1 / Math.max(1, 0.5 * CLUSTER_H * q.rad * vert);
           const fv = 1 - smooth01((q.d - FADE_TO * 0.86) / (FADE_TO * 0.14));
 
           for (let k = 0; k < lobes; k++) {
@@ -766,19 +1024,30 @@ export class CloudGeo {
              * when it crosses a ring boundary -- it loses its outliers and
              * keeps its body, which at that distance is a pixel or two. */
             lobe(q.seed, k, _lobe);
-            _p.set(_lobe.x * q.rad, _lobe.y * thick, _lobe.z * q.rad);
+            /* The yaw turns the cluster about its own axis, so it acts on
+             * the horizontal offset alone; the height comes from `lobe`
+             * unrotated, which is what keeps every base on one plane. */
+            _p.set(_lobe.x * q.rad, 0, _lobe.z * q.rad);
             _p.applyAxisAngle(_up, q.rot);
-            _p.set(q.x + _p.x, y + _p.y, q.z + _p.z);
+            _p.set(q.x + _p.x, y + _lobe.y * q.rad * vert, q.z + _p.z);
             /* Fewer lobes have to cover the same cloud, or a far cluster is
              * a body with nothing around it and the ring shows as a step
              * in cloud size. */
             const fat = 1 + (LOBES - lobes) * 0.055;
-            _s.set(_lobe.s * q.rad * fat, _lobe.s * thick * 1.15, _lobe.s * q.rad * fat);
-            _e.set(hashFloat(q.seed, k, 6) * 3, hashFloat(q.seed, k, 7) * 3, 0);
+            const rs = _lobe.s * q.rad * fat;
+            _s.set(rs, rs * LOBE_SQUASH * vert, rs);
+            /* A tilt and nothing more.  It used to be up to three radians
+             * on two axes, which stands a flattened lobe on its edge --
+             * and a spheroid flattened about y is unchanged by a yaw
+             * anyway, so the large angles bought variety in the one
+             * direction that had none to give.  A few degrees is enough to
+             * stop the bases reading as a single plane. */
+            _e.set(TILT * (hashFloat(q.seed, k, 6) - 0.5),
+                   0, TILT * (hashFloat(q.seed, k, 7) - 0.5));
             _q.setFromEuler(_e);
             _m.compose(_p, _q, _s);
             _m.toArray(mat, off * 16);
-            ctr[off * 3] = q.x; ctr[off * 3 + 1] = y; ctr[off * 3 + 2] = q.z;
+            ctr[off * 2] = mid; ctr[off * 2 + 1] = inv;
             fade[off] = fv;
             off++;
           }
@@ -791,7 +1060,7 @@ export class CloudGeo {
     this.count = clouds;
     this.mesh.count = off;
     this.mesh.instanceMatrix.needsUpdate = true;
-    this.aCentre.needsUpdate = true;
+    this.aCloud.needsUpdate = true;
     this.aFade.needsUpdate = true;
   }
 

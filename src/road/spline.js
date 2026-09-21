@@ -481,6 +481,11 @@ export class RoadPath {
        * the one visible tell a signed coordinate can leave. */
       if (back) o.u = -o.u;
     }
+    /* The foot itself, which `Terrain.heightAt` needs to know which way
+     * *outward* is -- the direction the earthwork daylights along, and so
+     * the direction the hillside's own slope has to be measured in.  It is
+     * already computed for `o.u` above. */
+    o.px = best.x; o.pz = best.z;
     o.s = back ? -(i + t) * STEP : (i + t) * STEP;
     o.y = n0.y + (n1.y - n0.y) * t;
     o.g = n0.g + (n1.g - n0.g) * t;

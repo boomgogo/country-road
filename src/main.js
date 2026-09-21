@@ -318,6 +318,10 @@ terrain.road = road;
  * missing world, which is why it survived two rounds of stills. */
 const chunks = new ChunkField(scene, terrain, road, {
   radius: VIEW_DIST, forward: 0.7, farLod: Q.farLod,
+  /* `?lod=1` pins the road corridor to 1 m spacing whatever the tier
+   * would have chosen.  A diagnostic for the verge creases and nothing
+   * else -- see `ChunkField._lodFor` and `ai/plan_3.md`. */
+  corridorStep: Number(params.get('lod')) || undefined,
 });
 /**
  * How far ahead of the car the road is kept traced, in metres of tarmac.

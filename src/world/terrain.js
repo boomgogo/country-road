@@ -86,15 +86,105 @@ const FILL_BATTER = 2.0;
  * a line, because the ramp's own slope lands in the answer at a quarter of
  * its value, and `0.25 / 4` is exactly the crease the old one drew.
  */
-const DAYLIGHT = 2.0;
-/** How much more of it a toe gets than a crest.  See `heightAt`. */
-const FILL_ROUND = 2.2;
+/**
+ * **And the two faults that were left in it, which are `prompt_3.md` item
+ * 2.**  `ai/perf-bench/verge.mjs` with `SECTION=2500` is the evidence:
+ * every crease this file has worked on is under 0.07 per metre there and
+ * there is a single spike of **0.206 at nine metres from the midline**,
+ * which is the daylight line and which is the dark line running along the
+ * verge in `ref/prompt_3_1.png`.
+ *
+ * *One.*  `k` was a height written down as a constant, and the parabola's
+ * curvature in ground terms is `m^2 / 2k` where `m` is how fast the two
+ * surfaces are closing per metre out.  A constant `k` is therefore a blend
+ * whose curvature is whatever the hillside happens to be doing.
+ *
+ * *Two, and it is the one that draws.*  `k` was ramped by `smoothstep01(
+ * over / (2 * HINGE))` to keep it under the batter's own height -- and on
+ * a **shallow** earthwork, which is most of the road, the daylight line
+ * arrives while that ramp is still near zero.  At s = 2500 the earthwork
+ * is 16 cm deep, it daylights two metres past the platform edge, and `k`
+ * there is 0.15 against a gap that closes at 0.14 per metre: the surface
+ * steps off the batter onto the hillside in half a metre of ground.  The
+ * rounding was in the code and not in the ground.
+ *
+ * `daylight()` below solves for the `k` that puts the curvature at
+ * `DAYLIGHT_K` instead of writing a height down, so the blend is a fixed
+ * width **in ground** and a shallow daylight line gets a small blend
+ * rather than none.  At s = 2500 that is `k` = 0.09 and a curvature of
+ * 0.11, and the 0.206 spike is gone.
+ *
+ * And the ramp goes with it, because `heightAt` no longer needs one -- see
+ * the note on branches there.  `FILL_ROUND` goes too: it widened the blend
+ * at a toe because `m` there is the fill slope *plus* the hillside's where
+ * in a cutting it is the cut slope *minus* it, and a `k` derived from `m`
+ * is already wider at a toe by exactly that factor.
+ */
+/** The curvature the daylight blend aims at, per metre of ground. */
+const DAYLIGHT_K = 0.10;
+/**
+ * ... and the most height it is allowed to spend getting there.
+ *
+ * `k` goes as `m^2`, so the steepest hillside the tracer will take asks
+ * for a blend that reaches further than the road is queried at all.  This
+ * is about what the constant it replaced was, so a steep daylight line is
+ * rounded as it always was and the change is all at the shallow end.
+ */
+const DAYLIGHT_MAX = 1.6;
+/** A floor on the closing rate, so a blend cannot collapse to nothing. */
+const CLOSE_MIN = 0.12;
+/**
+ * How far out the hillside's own slope is sampled, for `m`.  Long enough
+ * to be the slope the earthwork will actually meet rather than one hummock
+ * of it, short enough to still be the slope *here*.
+ */
+const PROBE = 3;
 
-function round(gap, k) {
-  if (gap >= k) return 0;
-  if (gap <= -k) return gap;
-  const u = gap - k;
-  return -(u * u) / (4 * k);
+/**
+ * The lower of two surfaces, with the corner between them rounded off over
+ * a height of `k`.  Exactly zero effect once they are `k` apart, exactly
+ * `min` once they have crossed by `k`, a parabola in between -- so it is
+ * C1 at both ends by construction, and its curvature in ground terms is
+ * `m^2 / 2k` where `m` is how fast the two are closing.
+ */
+function smoothMin(a, b, k) {
+  const d = a - b;
+  if (d >= k) return b;
+  if (d <= -k) return a;
+  const u = d - k;
+  return b - (u * u) / (4 * k);
+}
+
+/** ... and the upper. */
+function smoothMax(a, b, k) {
+  return -smoothMin(-a, -b, k);
+}
+
+/**
+ * How much rounding the daylight line gets here: the `k` whose curvature
+ * comes out at `DAYLIGHT_K` whatever the ground is doing.
+ *
+ * `slope` is the batter face's own, `nat` the hillside's outward from the
+ * road, and `sign` is -1 against the cut face, which climbs away from the
+ * platform while the hillside climbs with it so the two subtract, and +1
+ * against the fill face, which falls while the ground falls faster still.
+ *
+ * Both limits are *smooth*: a hypotenuse rather than `Math.max` for the
+ * floor, a harmonic mean rather than `Math.min` for the ceiling.  A kink
+ * in `k` is a crease in the ground, which is the one thing this function
+ * exists to remove, and `abs`, `min` and `max` are all kinks.
+ */
+function daylight(slope, nat, sign) {
+  const v = slope + sign * nat;
+  const m2 = v * v + CLOSE_MIN * CLOSE_MIN;
+  const want = m2 / (2 * DAYLIGHT_K);
+  /* A soft ceiling rather than `Math.min`, which is a kink.  The harmonic
+   * mean is the obvious smooth one and it is far too lossy -- it takes a
+   * fifth off a `want` that is only a quarter of the cap, which is most of
+   * the road.  This one is within three per cent of `want` there and still
+   * approaches the cap from below. */
+  const r = want / DAYLIGHT_MAX;
+  return want / Math.sqrt(1 + r * r);
 }
 
 /**
@@ -246,19 +336,24 @@ function crown(d, w) {
  *
  * What it costs is that the crest of a cut and the toe of a fill move out
  * by half the fillet, three metres, and the earthwork carries about that
- * much less material.  `round()` eases the *other* end of the batter,
+ * much less material.  `daylight()` eases the *other* end of the batter,
  * where it daylights into the hillside, and the two blends are keyed on
  * different things -- this one on distance out from the platform, that one
  * on how far the face still is from natural ground -- so on an earthwork
  * too shallow to have room for both they simply overlap, which is a
  * shallower face still and not a crease.
  */
-const HINGE = 6;
+const HINGE = 16;
 
 function batter(over, ratio) {
   return over < HINGE
     ? (over * over) / (2 * HINGE * ratio)
     : (over - HINGE * 0.5) / ratio;
+}
+
+/** ... and its slope, which is the derivative of the line above. */
+function batterSlope(over, ratio) {
+  return over < HINGE ? over / (HINGE * ratio) : 1 / ratio;
 }
 
 export class Terrain {
@@ -356,43 +451,65 @@ export class Terrain {
     const edge = q.y + crown(w, w);
     const over = q.d - w;
 
-    /* How much rounding the crest is allowed here.  See `round`: it has to
-     * stay under the batter's own height or the two branches below part
-     * company at the platform edge. */
-    const k = DAYLIGHT * smoothstep01(over / (2 * HINGE));
+    /* **And there is no cut branch and no fill branch.**
+     *
+     * What was here chose one: `h > edge` picked the cut face or the fill
+     * face and rounded the hillside against it.  That choice is a *step*.
+     * Both roundings pull the surface `k / 4` off natural ground wherever
+     * the two surfaces are merely close -- downward against the cut face,
+     * upward against the fill -- so wherever the hillside crosses platform
+     * level the ground jumps by `k / 2`, and it crosses along the length
+     * of the road.  That is what forced `k` to be ramped to nothing at the
+     * platform edge, and that ramp is what left the daylight line of a
+     * shallow earthwork with no rounding at all.  See `daylight`.
+     *
+     * Both faces, and the hillside taken against both:
+     *
+     *     y = max( min( natural, cut ), fill )
+     *
+     * `fill <= edge <= cut` always, so the hard version of that expression
+     * *is* the two branches, written without the choice -- deep in a
+     * cutting the `min` returns the cut face and the `max` leaves it, deep
+     * in fill the `min` passes the hillside through and the `max` returns
+     * the fill face, and in between both pass it through and the ground is
+     * the ground.  Rounding the two corners then costs nothing in
+     * continuity, because there is no longer a branch to be on the wrong
+     * side of: where the two faces meet at the platform edge the blends
+     * simply overlap, and an overlap is an offset of about a seventh of
+     * `k` and not a step of half of it.  With `k` at a tenth of a metre
+     * there, that is a centimetre. */
+    const ox = (x - q.px) / q.d, oz = (z - q.pz) / q.d;
+    const nat = (this.hm.base(x + ox * PROBE, z + oz * PROBE) - h) / PROBE;
 
-    let y;
-    if (h > edge) {
-      /* Cutting: the hillside is above the carriageway, so it is cut back
-       * at 1:CUT_BATTER until it meets itself. */
-      const face = edge + batter(over, CUT_BATTER);
-      const gap = h - face;
-      if (gap <= -k) return h;                      // daylighted and clear
-      y = face + round(gap, k);
-    } else {
-      /* Embankment: the ground falls away, so it is built up at 1:FILL. */
-      const face = edge - batter(over, FILL_BATTER);
-      const gap = face - h;
-      /* **And the toe gets more of it than the crest does.**
-       *
-       * The blend's curvature is `m^2 / 2k`, where `m` is how fast the two
-       * surfaces are closing -- and on ground falling away from the road
-       * `m` is the fill slope *plus* the hillside's, where in a cutting it
-       * is the cut slope *minus* it.  So the same `k` buys a much tighter
-       * blend at a toe than at a crest, and the embankments came out with
-       * a hard line along the foot of the fill where the cuttings came out
-       * clean: the verge probe went 6.3 to 2.6 on a cutting and 9.9 to
-       * 12.6 on an embankment, which is the wrong direction and is the
-       * only case in this iteration that got worse before this line.
-       *
-       * The toe of an embankment is also the place a real one is most
-       * rounded -- it is loose material at its angle of repose meeting a
-       * field -- so widening it is not a cheat, and it is what FILL_BATTER
-       * is already saying one line up. */
-      const kf = k * FILL_ROUND;
-      if (gap <= -kf) return h;
-      y = face - round(gap, kf);
-    }
+    const cut = edge + batter(over, CUT_BATTER);
+    const fill = edge - batter(over, FILL_BATTER);
+    /* ... and neither blend may be wider than the gap between the two
+     * faces.  At the platform edge they are the same surface, so without
+     * this the fill blend rounds the cut face and the cut blend rounds the
+     * fill, each lifting the other by a quarter of its own `k` -- and that
+     * lift tapers off over the metre it takes the faces to separate, which
+     * is a crease of its own.  Measured at s = 2500: 0.132 per metre at
+     * the platform edge against 0.070 before, which is trading one line
+     * for another.
+     *
+     * `k * smoothstep(sep / 2k)` is at most `sep` for every `sep`, because
+     * `smoothstep(t) <= 2t` on the whole interval -- so the property is
+     * held by construction rather than by a tuned constant.  And unlike
+     * the ramp this file used to have, it is *symmetric*: both blends shut
+     * down together as the faces close, so nothing depends on which side
+     * of anything the hillside is, and the daylight line -- where the
+     * faces are long since apart -- keeps the whole of its `k`. */
+    const sep = cut - fill;
+    let kc = daylight(batterSlope(over, CUT_BATTER), nat, -1);
+    let kf = daylight(batterSlope(over, FILL_BATTER), nat, 1);
+    kc *= smoothstep01(sep / (2 * kc));
+    kf *= smoothstep01(sep / (2 * kf));
+
+    /* The common case by a distance: the hillside is clear of both faces,
+     * so the ground is the ground and the fade below is a no-op. */
+    if (h < cut - kc && h > fill + kf) return h;
+
+    const y = smoothMax(smoothMin(h, cut, kc), fill, kf);
 
     /* --- and out, before the road stops being asked about ---------------
      *
@@ -496,4 +613,4 @@ export class Terrain {
   }
 }
 
-const _q = { d: 0, y: 0, g: 0, gfa: 0, s: 0, node: null };
+const _q = { d: 0, y: 0, g: 0, gfa: 0, s: 0, px: 0, pz: 0, node: null };

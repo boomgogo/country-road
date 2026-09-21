@@ -59,6 +59,9 @@ picture, on any device.
 standard materials, no post. It only works on the dev server (`npm run dev`);
 the production build always draws cel.
 `?rec=1` hands the frame loop to a script and skips the load screen.
+`?lod=1` pins the ground in the road corridor to 1 m vertex spacing however
+far it is from the car — a diagnostic for the ink on the verge, and an
+expensive one: it is the case `FAR_LOD` exists to prevent.
 `?car=coupe` keeps the code-built stand-in instead of the modelled car.
 
 `?t=18:20`, `?season=autumn`, `?weather=heavyRain` and `?day=7` pin the sky, and

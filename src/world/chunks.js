@@ -114,6 +114,19 @@ export const FAR_LOD = {
   ],
 };
 
+/**
+ * How wide the road corridor is, for the diagnostic in `_lodFor`.
+ *
+ * Narrow on purpose.  This was 160, and 160 m of 1 m ground either side of
+ * a winding road across the whole loaded ellipse is about a million
+ * vertices -- which is the case `FAR_LOD` exists to prevent, measured at
+ * 42 ms of scene pass on an HD 630, and the chunk builder never caught up
+ * with it inside a probe's settle.  The road's own query radius is 26 m
+ * and the verge lines live inside that, so a chunk within 48 m of the
+ * midline is every chunk the question is about.
+ */
+const CORRIDOR = 48;
+
 function bandFor(table, dist) {
   for (const b of table) if (dist < b.within) return b.step;
   return 16;
@@ -142,6 +155,8 @@ export class ChunkField {
     this.budgetMs = opts.budgetMs ?? 4;
     /** The coarsest spacing allowed by distance from the car.  See `FAR_LOD`. */
     this.farLod = opts.farLod ?? FAR_LOD.high;
+    /** Diagnostic: pin the corridor's spacing.  See `_lodFor`. */
+    this.corridorStep = opts.corridorStep ?? null;
     /* Road distance for cells that are not live, for `_neighbourStep`.
      * See `_relod`. */
     this._roadDistCache = new Map();
@@ -249,7 +264,25 @@ export class ChunkField {
    * vertices.
    */
   _lodFor(ox, oz, dRoad = this._roadDist(ox, oz)) {
-    return this._capLod(Math.min(lodFor(dRoad), this._carLod(ox, oz)), ox, oz);
+    const step = this._capLod(Math.min(lodFor(dRoad), this._carLod(ox, oz)), ox, oz);
+    /* The diagnostic override, and it is *only* a diagnostic -- `?lod=1`.
+     *
+     * The creases on the verge reach the screen as a slope break of
+     * `curvature x vertex spacing`, so a crease that is under the ink's
+     * knee where the corridor is meshed at 1 m is twice over it at 2 m and
+     * four times at 4 m, and `FAR_LOD` steps the corridor to 2 m and then
+     * to 4 m as the ground gets further from the car.  That gives two
+     * quite different explanations for why `ref/prompt_3_1.png` is clean
+     * in the near field and streaked in the middle distance, and they want
+     * different fixes.  Pinning the corridor's spacing is what separates
+     * them: if the streaks do not move, the lattice is not the multiplier.
+     *
+     * Kept out of the frame-time path -- one comparison against a field
+     * that is null on every ordinary run.  See `ai/plan_3.md` A0. */
+    if (this.corridorStep && dRoad < CORRIDOR) {
+      return Math.min(step, this.corridorStep);
+    }
+    return step;
   }
 
   /** `step`, made no finer than `FAR_LOD` allows.  `scale` as `_carLod`. */
