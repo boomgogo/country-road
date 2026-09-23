@@ -1,7 +1,7 @@
 
 
 1. Write a script to play the game automatically
-2. Record a video of one entire drive continuously of a whole "year", all 4 seasons, without cut in the middle
+2. Record a video of one entire drive continuously of 2 game-days, without cut in the middle
     - store files related to this in /media/DRIVE2
 3. Based on your gameplay and recording, how do I make this game more fun to play?
     - write this into ai/suggest_4.md
