@@ -482,6 +482,9 @@ function startMode() {
   if (RECORDING) return 'full';
   if (params.has('auto')) {
     const v = params.get('auto');
+    /* Bare `?auto` is the empty string, and `Number('')` is 0 -- which
+     * is `manual`, the one mode `?auto` can never have meant. */
+    if (!v) return 'full';
     if (AUTO_MODES.includes(v)) return v;
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 && n < AUTO_MODES.length
@@ -590,6 +593,50 @@ let odometer = 0;
 let troubleFor = 0;
 
 /**
+ * The ground under the car, counted.  `prompt_4.md`: "the terrain can fail
+ * to generate at times and my car would fall into the void".
+ *
+ * Three questions a frame, all cheap: is the chunk under the car live, is
+ * the collider the physics world holds for it the one built from *that*
+ * chunk, and is the car more than a car's height below the ground the
+ * terrain function says is there.  The last is the only one that needs no
+ * chunk at all -- `heightAt` is the function the chunks are built from --
+ * which is what lets it catch a fall whatever caused it.  Read by
+ * `?debug` and by `perf-bench/void.mjs`.
+ *
+ * And it is the last net.  `ChunkField._ensureUnder` means the chunk under
+ * the car always exists, but a collider can still be a frame behind its
+ * chunk, and a car that is two metres under the ground it should be on
+ * for most of a second is not going to come back up by itself -- so it
+ * goes back on the road, the way `troubleFor` puts back a car on its roof.
+ */
+const groundWatch = { frames: 0, noChunk: 0, noCollider: 0, below: 0, falls: 0, aheadMissing: 0, recovered: 0 };
+let wasBelow = false;
+let belowFor = 0;
+/** Is the collider the physics is about to use the one built from the
+ *  chunk under the car?  Asked between `syncTerrain` and the car's step,
+ *  which is the only moment the answer is the one the wheels get. */
+function colliderUnder() {
+  const c = chunks.chunkAt(car.pos.x, car.pos.z);
+  if (!c) return;
+  const e = physics.terrain.get(ChunkField.key(c.ix, c.iz));
+  if (!e || e.chunk !== c || e.rev !== c.rev) groundWatch.noCollider++;
+}
+function watchGround(dt) {
+  const g = groundWatch;
+  g.frames++;
+  if (!chunks.chunkAt(car.pos.x, car.pos.z)) g.noChunk++;
+  const ahead = chunks.chunkAt(car.pos.x + Math.cos(car.yaw) * 60, car.pos.z + Math.sin(car.yaw) * 60);
+  if (!ahead) g.aheadMissing++;
+  const below = car.pos.y < terrain.heightAt(car.pos.x, car.pos.z) - 2;
+  if (below) g.below++;
+  if (below && !wasBelow) g.falls++;
+  wasBelow = below;
+  belowFor = below ? belowFor + dt : 0;
+  if (belowFor > 0.4) { g.recovered++; belowFor = 0; recover(); }
+}
+
+/**
  * Back onto the road, facing the right way.
  *
  * Being able to leave the road means being able to end up on your roof in
@@ -599,7 +646,11 @@ let troubleFor = 0;
  * just rolled the car is exactly the player who has not read the hint
  * line.
  */
+/** Counts for the harnesses: `tools/play/` reads these. */
+const stats = { recovers: 0 };
+
 function recover() {
+  stats.recovers++;
   const near = road.nearest(car.pos.x, car.pos.z, {});
   car.placeOn(road, near ? near.s : auto.s);
   auto.i = 0;
@@ -1240,6 +1291,7 @@ function tick(dt) {
    * a chunk arrives is a frame of the car falling through the hole where
    * it will be. */
   physics.syncTerrain(chunks, car.pos.x, car.pos.z);
+  colliderUnder();
   physics.syncRails(furniture, road, car.pos.x, car.pos.z);
   physics.syncTrees(scatter, car.pos.x, car.pos.z);
   car.update(dt, axes);
@@ -1273,6 +1325,7 @@ function tick(dt) {
   if (car.inTrouble || car.pos.y < WATER_LEVEL - 0.4) troubleFor += dt;
   else troubleFor = 0;
   if (troubleFor > 3.5) recover();
+  watchGround(dt);
 
   odometer += Math.abs(car.speed) * dt;
   hud.update(odometer, car.speed, simTime);
@@ -1372,6 +1425,7 @@ resize();
  * every time, and never without the cel pipeline, which is what scales. */
 const governor = new ResolutionGovernor({
   scale: Q.scale, minScale: Q.minScale, maxScale: Q.maxScale,
+  downFps: Q.downFps, upFps: Q.upFps,
   enabled: !RECORDING && !!pipeline && params.get('dynres') !== '0',
   effective: (s) => pipeline.scaleFor(innerWidth, innerHeight, s),
   apply: (s) => { pipeline.maxScale = s; resize(); },
@@ -1394,8 +1448,48 @@ function frame() {
   governor.frame(raw);
   tick(dt);
   draw();
+  if (debug) debug.frame(raw);
   requestAnimationFrame(frame);
 }
+
+/**
+ * `?debug=1`: what the frame went through on the way to the screen, and
+ * whether the ground is keeping up.  `prompt_4.md` reported blur on a
+ * phone and a Surface Go and the ground failing to arrive on both, and
+ * neither can be reproduced on the machine this was written on -- so this
+ * is the thing to open on those devices and screenshot.  Twice a second,
+ * a few lines of monospace, top left; nothing at all without the flag.
+ */
+const debug = params.get('debug') === '1' ? (() => {
+  const el = document.createElement('pre');
+  el.style.cssText = 'position:fixed;left:8px;top:8px;z-index:20;margin:0;padding:6px 8px;'
+    + 'font:11px/1.35 ui-monospace,Menlo,Consolas,monospace;color:#fff;'
+    + 'background:rgba(0,0,0,.55);pointer-events:none;white-space:pre';
+  document.body.appendChild(el);
+  let acc = 0, n = 0, worst = 0;
+  return {
+    frame(dt) {
+      acc += dt; n++; worst = Math.max(worst, dt);
+      if (acc < 0.5) return;
+      const p = pipeline, cv = renderer.domElement, w = groundWatch;
+      const bt = Object.entries(chunks.buildTimes)
+        .map(([k, v]) => `${k}m ${(v.ms / v.n).toFixed(0)}ms`).join('  ');
+      el.textContent = [
+        `${TIER.name} (${TIER.why})  ${GPU}`,
+        `dpr ${devicePixelRatio}  css ${innerWidth}x${innerHeight}  canvas ${cv.width}x${cv.height}`,
+        p ? `scene ${p.rtScene.width}x${p.rtScene.height} (${p.scale.toFixed(2)}x css)  route ${p.mode}` : 'no pipeline',
+        `fps ${(n / acc).toFixed(0)}  worst ${(worst * 1000).toFixed(0)}ms  governor ${governor.scale}`
+          + ` [${governor.levels[0]}..${governor.levels[governor.levels.length - 1]}]`,
+        `chunks ${chunks.live.size} live  ${chunks.queue.length} queued  ${chunks.holeNear} holes near`
+          + `  drain ${chunks.drainMs.toFixed(1)}ms`,
+        `build  ${bt}`,
+        `ground  no-chunk ${w.noChunk}  no-collider ${w.noCollider}  falls ${w.falls}`
+          + `  rescued ${chunks.rescued}  recovered ${w.recovered}`,
+      ].join('\n');
+      acc = 0; n = 0; worst = 0;
+    },
+  };
+})() : null;
 
 function step(dt) {
   tick(dt);
@@ -1515,7 +1609,7 @@ window.__game = {
   car, chase, auto, input, hud, sky, furniture, pipeline, physics, pointer,
   sound,
   clock, weather, atmos, celestial, precip, headlights, save, loader, lapse,
-  cloudField, clouds, touch, governor,
+  cloudField, clouds, touch, governor, groundWatch, stats,
   /** Which tier, why, and on what -- see `core/quality.js`. */
   quality: { tier: TIER.name, why: TIER.why, gpu: GPU },
   /** For `tools/probe/rest.mjs`: what `Z` would do, and doing it. */

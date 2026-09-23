@@ -11,6 +11,7 @@
     "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
+    "mp4-muxer": "^5.2.2",
     "vite": "^8.2.0",
     "wrangler": "^4.125.0"
   },

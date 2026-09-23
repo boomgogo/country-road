@@ -143,7 +143,9 @@ vite.config.ts.timestamp-*
 .vite/
 
 ref/
-# Chrome profile, created in the working directory by ai/perf-bench/cdp.mjs
+# Chrome profiles, created in the working directory by perf-bench/cdp.mjs --
+# one per harness, so they can run at once
 chrome-prof/
+chrome-prof-*/
 
 capture/

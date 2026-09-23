@@ -44,6 +44,8 @@ import { FAR_LOD } from '../world/chunks.js';
  *   rather than cloud.  The knob is here for the device that proves that
  *   wrong.
  * @property {object[]} farLod   see `FAR_LOD`
+ * @property {number} downFps    the governor steps the scene down below this
+ * @property {number} upFps      and considers stepping up above this
  */
 
 /** @type {Record<string, Tier>} */
@@ -57,25 +59,39 @@ export const TIERS = {
     cloudScale: 0.5, cloudHistory: 1,
     cloudCount: 420, cloudDetail: 1,
     farLod: FAR_LOD.high,
+    downFps: 48, upFps: 56,
   },
   /* Integrated graphics.  No supersample to start with, and the governor
    * may go below 1 -- a soft picture at 50 frames is a better drive than a
-   * sharp one at 20. */
+   * sharp one at 20.
+   *
+   * But not as far below as it could, and not for as little.  `prompt_4`
+   * reported the Surface Go as blurry, and at a floor of 0.6 on its DPR
+   * of 1.5 the scene was four tenths of the panel.  The floor is 0.75
+   * now, a half of the panel, where `post.js`'s up pass still draws a
+   * clean line; and the governor gives up resolution below 40 frames
+   * rather than 48, because on a machine this weak it was always going to
+   * be under 48, so the old target meant the floor for the whole drive.
+   * A judgement, not a measurement: nothing here has run on that GPU. */
   medium: {
-    scale: 1, maxScale: 1.5, minScale: 0.6,
+    scale: 1, maxScale: 1.5, minScale: 0.75,
     anisotropy: 4, shadowMap: 2048,
     cloudScale: 0.3, cloudHistory: 0.5,
     cloudCount: 300, cloudDetail: 1,
     farLod: FAR_LOD.medium,
+    downFps: 40, upFps: 50,
   },
   /* Phones.  The scale and the shadow map are what `?quality=low` already
-   * was; the cloud march was 0.4 and comes down with the medium tier's. */
+   * was; the cloud march was 0.4 and comes down with the medium tier's.
+   * The floor and the target move for the medium tier's reasons, further:
+   * on a DPR-3 phone 0.6 of a CSS pixel was a fifth of the panel. */
   low: {
-    scale: 1.25, maxScale: 1.25, minScale: 0.6,
+    scale: 1.25, maxScale: 1.25, minScale: 0.8,
     anisotropy: 2, shadowMap: 1536,
     cloudScale: 0.3, cloudHistory: 0.5,
     cloudCount: 200, cloudDetail: 1,
     farLod: FAR_LOD.low,
+    downFps: 36, upFps: 45,
   },
 };
 
@@ -127,8 +143,9 @@ export function pickTier({ param, recording, coarse, gpu }) {
  * waits for the frame after a move to settle before judging it, and
  * remembers what did not work.
  *
- *  - **Down** when the median frame is slower than about 48 frames a
- *    second.  A median, over most of a second, so a chunk build or a
+ *  - **Down** when the median frame is slower than the tier's `downFps`
+ *    (48 frames a second at `high`, less below it).  A median, over most
+ *    of a second, so a chunk build or a
  *    garbage collection is not a reason to blur the picture.
  *  - **Up** only after several seconds held at the display's rate, and a
  *    scale that was tried and dropped straight back becomes the ceiling
@@ -150,8 +167,11 @@ export class ResolutionGovernor {
    * @param {(scale: number) => void} o.apply
    * @param {boolean} [o.enabled]
    */
-  constructor({ scale, minScale, maxScale, effective, apply, enabled = true }) {
+  constructor({ scale, minScale, maxScale, effective, apply, enabled = true,
+                downFps = 48, upFps = 56 }) {
     this.enabled = enabled && maxScale > minScale;
+    this.downDt = 1 / downFps;
+    this.upDt = 1 / upFps;
     this.effective = effective;
     this.apply = apply;
     /* Steps of 12 % in linear scale, so about a quarter in pixels, counted
@@ -205,7 +225,7 @@ export class ResolutionGovernor {
       }
     }
 
-    if (med > 1 / 48) {
+    if (med > this.downDt) {
       this.held = 0;
       const down = this._next(-1);
       if (down !== this.i && down >= this.floor) {
@@ -217,7 +237,7 @@ export class ResolutionGovernor {
         this.before = med;
         this._move(down);
       }
-    } else if (med < 1 / 56) {
+    } else if (med < this.upDt) {
       this.held += med * 45;
       const up = this._next(+1);
       if (this.held > 6 && up !== this.i && up <= this.ceiling) {

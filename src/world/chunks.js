@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { groundMaterial } from './groundmat.js';
-import { ROAD_OFF, WATER_LEVEL } from './terrain.js';
+import { ROAD_OFF, ROAD_QUERY, WATER_LEVEL } from './terrain.js';
 import { cel } from '../core/toon.js';
 
 /* ------------------------------------------------------------------ *
@@ -127,6 +127,46 @@ export const FAR_LOD = {
  */
 const CORRIDOR = 48;
 
+/**
+ * The queue's three classes, and why the order is what it is.
+ *
+ * `MISSING` is ground that does not exist: a hole, and under the car a
+ * fall.  `FIX` is ground that exists and is wrong -- a road that moved, a
+ * resolution the car or the physics needs, a seam to restitch -- which is
+ * a picture or a collider that is off, but is there.  `SAVE` is ground
+ * that is finer than it need be, which costs frame time and nothing else.
+ *
+ * The queue used to be sorted on a signed distance, `-2` for an
+ * invalidation and `-1` for an urgent rebuild, so both classes of *fix*
+ * went ahead of every missing chunk; and a missing chunk's distance was
+ * the one it had when it was requested, 2 km out at the front of the
+ * field, and was never updated as the car drove toward it.  On a fast
+ * CPU the queue is short and neither mattered.  At a 6x CPU throttle
+ * (`perf-bench/void.mjs`) the queue grew without bound, `live` drained
+ * from 427 chunks to 50, and the car drove off the edge of the built
+ * world six times in five minutes.
+ *
+ * Now the order is recomputed every frame from where the car *is*: the
+ * key is the distance to the car, plus `FIX_BIAS` for a fix, so a hole
+ * within 150 m of the car's current distance outranks a fix, and a
+ * saving goes last.
+ */
+const MISSING = 0, FIX = 1, SAVE = 2;
+const FIX_BIAS = 150;
+/** A missing chunk nearer than this is built at 4 m first -- a sixth of
+ *  the time of a 1 m chunk, even after `_build` got cheaper -- and
+ *  refined through `_relod` like any other.  Only near: further out
+ *  `FAR_LOD` already starts everything at 4 m. */
+const COARSE_FIRST = 420;
+/** While a chunk this near is missing, the build budget goes up.  A
+ *  dropped frame is a better outcome than a fall. */
+const HOLE_NEAR = 260;
+const HOLE_BUDGET = 12;
+/** Seams mended per frame.  Each is four edge rows of `heightAt` -- about
+ *  0.7 ms for a 1 m chunk on this machine -- so a handful is a small,
+ *  steady cost, and the rest wait a frame. */
+const RESTITCH_PER_FRAME = 3;
+
 function bandFor(table, dist) {
   for (const b of table) if (dist < b.within) return b.step;
   return 16;
@@ -192,6 +232,16 @@ export class ChunkField {
     this.waterMat.depthWrite = false;
     this.wpool = new Map();
     this.built = 0;
+    /** Times the chunk under the car had to be built on the spot. */
+    this.rescued = 0;
+    /** Missing chunks near the car, as of the last `_prioritise`. */
+    this.holeNear = 0;
+    this.buildTimes = {};
+    /** Rebuilds queued by `_relod`, by reason.  Diagnostic. */
+    this.reasons = {};
+    this._buildMs = 0;
+    this._lastStep = 0;
+    this.drainMs = 0;
     this.recycled = 0;
     this.relodded = 0;
     this.invalidated = 0;
@@ -325,25 +375,40 @@ export class ChunkField {
     if (list && list.length) return list.pop();
     const n = CHUNK / step;              // cells per side
     const w = n + 1;                     // vertices per side
+    /* The grid, then a skirt: one more vertex under each edge vertex.
+     * See `writeSkirt`. */
+    const nv = w * w + 4 * w;
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(w * w * 3), 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(w * w * 3), 3));
-    geo.setAttribute('roadU', new THREE.BufferAttribute(new Float32Array(w * w), 1));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nv * 3), 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(nv * 3), 3));
+    geo.setAttribute('roadU', new THREE.BufferAttribute(new Float32Array(nv), 1));
     /* The mask, as a magnitude, and separate from the signed offset above
      * for the reason `terrain.js` gives at `ROAD_QUERY`.  Added here as
      * well as written in `_build` because geometries are *pooled*: a
      * recycled chunk missing the attribute reads zeros, and zero means
      * "you are on the carriageway", which would paint the whole chunk. */
-    geo.setAttribute('roadA', new THREE.BufferAttribute(new Float32Array(w * w), 1));
-    geo.setAttribute('roadS', new THREE.BufferAttribute(new Float32Array(w * w), 1));
-    geo.setAttribute('curv', new THREE.BufferAttribute(new Float32Array(w * w), 1));
-    const idx = new Uint32Array(n * n * 6);
+    geo.setAttribute('roadA', new THREE.BufferAttribute(new Float32Array(nv), 1));
+    geo.setAttribute('roadS', new THREE.BufferAttribute(new Float32Array(nv), 1));
+    geo.setAttribute('curv', new THREE.BufferAttribute(new Float32Array(nv), 1));
+    const idx = new Uint32Array(n * n * 6 + 4 * n * 12);
     let o = 0;
     for (let j = 0; j < n; j++) {
       for (let i = 0; i < n; i++) {
         const a = j * w + i, b = a + 1, c = a + w, d = c + 1;
         idx[o++] = a; idx[o++] = c; idx[o++] = b;
         idx[o++] = b; idx[o++] = c; idx[o++] = d;
+      }
+    }
+    /* The skirt, both windings: the ground material is front-faced, and a
+     * crack can be looked into from either chunk's side. */
+    for (let e = 0; e < 4; e++) {
+      for (let t = 0; t < n; t++) {
+        const a = edgeIndex(w, e, t), b = edgeIndex(w, e, t + 1);
+        const c = w * w + e * w + t, d = c + 1;
+        idx[o++] = a; idx[o++] = c; idx[o++] = b;
+        idx[o++] = b; idx[o++] = c; idx[o++] = d;
+        idx[o++] = a; idx[o++] = b; idx[o++] = c;
+        idx[o++] = b; idx[o++] = d; idx[o++] = c;
       }
     }
     geo.setIndex(new THREE.BufferAttribute(idx, 1));
@@ -375,6 +440,73 @@ export class ChunkField {
     const list = this.hpool.get(step);
     if (list && list.length) return list.pop();
     return new Float32Array(n);
+  }
+
+  /**
+   * Re-stitch a chunk to neighbours that have changed resolution, in
+   * place.
+   *
+   * `_relod` used to rebuild the whole chunk for this, and it was most of
+   * the rebuilding there was: in a minute of driving at a 6x CPU throttle,
+   * 142 of 220 rebuilds were seams, each one a 1 m or 2 m chunk rebuilt
+   * from nothing -- 135 ms of main thread for the 1 m ones -- because the
+   * chunk *next door* had been refined.  All that changes is the edge.
+   *
+   * So: put the four edge rows back to the terrain's own heights, stitch
+   * them against the neighbours as they are now, exactly as `_build`
+   * does, and rewrite the positions and normals of the two outer rings.
+   * The base is rounded through a float the way `_build`'s grid rounds
+   * it, so an unstitched edge comes out bit-identical to the neighbour's
+   * copy of the same edge.  Water is left alone: an edge row moves by
+   * centimetres, and a water mesh that is a row out at a shoreline is not
+   * a crack.  `rev` tells the physics its collider is stale.
+   */
+  _restitch(c) {
+    const T = this.terrain;
+    const { w, step, heights } = c;
+    const ox = c.ix * CHUNK, oz = c.iz * CHUNK;
+    const last = w - 1;
+    const hAt = (x, z) => T.heightAt(x, z, Math.fround(T.hm.base(x, z)));
+    for (let i = 0; i < w; i++) {
+      heights[i] = hAt(ox + i * step, oz);
+      heights[last * w + i] = hAt(ox + i * step, oz + last * step);
+      heights[i * w] = hAt(ox, oz + i * step);
+      heights[i * w + last] = hAt(ox + last * step, oz + i * step);
+    }
+    const nb = [
+      this._stepOf(c.ix, c.iz - 1), this._stepOf(c.ix, c.iz + 1),
+      this._stepOf(c.ix - 1, c.iz), this._stepOf(c.ix + 1, c.iz),
+    ];
+    stitchEdge(heights, w, step, nb[0], (i) => i, 1);
+    stitchEdge(heights, w, step, nb[1], (i) => (w - 1) * w + i, 1);
+    stitchEdge(heights, w, step, nb[2], (j) => j * w, w);
+    stitchEdge(heights, w, step, nb[3], (j) => j * w + (w - 1), w);
+
+    const geo = c.mesh.geometry;
+    const pos = geo.attributes.position.array;
+    const nor = geo.attributes.normal.array;
+    const ring = (i, j) => {
+      const k = j * w + i;
+      pos[k * 3 + 1] = heights[k];
+      vertexNormal(T, heights, w, step, i, j, ox + i * step, oz + j * step, nor);
+    };
+    for (let i = 0; i < w; i++) {
+      for (const j of [0, 1, last - 1, last]) ring(i, j);
+      for (const j of [0, 1, last - 1, last]) ring(j, i);
+    }
+    writeSkirt(geo, w, step);
+    geo.attributes.position.needsUpdate = true;
+    geo.attributes.normal.needsUpdate = true;
+    geo.computeBoundingSphere();
+    c.nb = nb;
+    c.rev = (c.rev || 0) + 1;
+  }
+
+  /** One scratch grid for `_build`'s landform samples.  One is enough:
+   *  a single build is in flight at a time, in `_drain` and in `flush`. */
+  _baseGrid(n) {
+    if (!this._base || this._base.length < n) this._base = new Float32Array(n);
+    return this._base;
   }
 
   _giveHeights(step, arr) {
@@ -412,7 +544,7 @@ export class ChunkField {
         if (la * la + lc * lc > 1) continue;
         const k = ChunkField.key(ix, iz);
         wanted.add(k);
-        if (!this.live.has(k)) this._request(ix, iz, Math.hypot(dx, dz));
+        if (!this.live.has(k)) this._request(ix, iz);
       }
     }
 
@@ -425,8 +557,47 @@ export class ChunkField {
       return false;
     });
     this._relod();
-    this.queue.sort((a, b) => a.d - b.d);
+    this._prioritise();
+    this._ensureUnder(px, pz);
     this._drain();
+  }
+
+  /** Re-key the queue from where the car is now.  See `MISSING`. */
+  _prioritise() {
+    this.holeNear = 0;
+    for (const q of this.queue) {
+      const d = this._carDist(q.ix * CHUNK, q.iz * CHUNK);
+      q.key = q.cls === SAVE ? 1e7 + d : q.cls === FIX ? d + FIX_BIAS : d;
+      if (q.cls === MISSING && d < HOLE_NEAR) this.holeNear++;
+    }
+    this.queue.sort((a, b) => a.key - b.key);
+  }
+
+  /**
+   * The chunk under the car exists, whatever the queue thinks.
+   *
+   * Everything above makes this rare.  This makes it impossible: if the
+   * cell the car is in is not live, it is built now, at 4 m, in this
+   * frame -- a few milliseconds even on a slow CPU, because 4 m is 1 089
+   * vertices.  The physics picks it up on the next tick.  If the cell's
+   * build is the one already in flight it is finished instead, since a
+   * second build of the same key is the bug `pending` exists to prevent.
+   */
+  _ensureUnder(px, pz) {
+    const ix = Math.floor(px / CHUNK), iz = Math.floor(pz / CHUNK);
+    const k = ChunkField.key(ix, iz);
+    if (this.live.has(k)) return;
+    this.rescued++;
+    if (this.building && this.buildingAt && this.buildingAt.k === k) {
+      while (!this.building.next().done);
+      this.building = null; this.buildingAt = null;
+      return;
+    }
+    const i = this.queue.findIndex((q) => q.k === k);
+    if (i >= 0) this.queue.splice(i, 1);
+    this.pending.add(k);
+    const gen = this._build(ix, iz, 4);
+    while (!gen.next().done);
   }
 
   /**
@@ -482,38 +653,61 @@ export class ChunkField {
 
     /* Pass two: rebuild anything at the wrong resolution, or stitched to a
      * neighbour that has since changed its own. */
+    let restitched = 0;
     for (const c of entries) {
-      let why = 0;
-      if (c.want < c.step) why = -1;                       // correctness, urgent
-      else if (c.relax > c.step) why = 1;                  // a saving, can wait
+      let why = 0, reason = '';
+      if (c.want < c.step) { why = -1; reason = 'finer'; }          // correctness, urgent
+      else if (c.relax > c.step) { why = 1; reason = 'coarser'; }   // a saving, can wait
       else if (c.nb) {
         for (let i = 0; i < 4; i++) {
-          if (this._neighbourStep(c, i) !== c.nb[i]) { why = -1; break; }
+          if (this._neighbourStep(c, i) !== c.nb[i]) { why = -1; reason = 'seam'; break; }
         }
       }
       if (!why) continue;
       const k = ChunkField.key(c.ix, c.iz);
       if (this.pending.has(k)) continue;
+      /* A seam is one edge row, not a chunk.  See `_restitch`. */
+      if (reason === 'seam' && restitched < RESTITCH_PER_FRAME) {
+        this._restitch(c);
+        restitched++;
+        this.reasons.restitch = (this.reasons.restitch || 0) + 1;
+        continue;
+      }
+      if (reason === 'seam') continue;
       this.pending.add(k);
-      this.queue.push({
-        ix: c.ix, iz: c.iz, k,
-        d: why < 0 ? -1 : this._carDist(c.ix * CHUNK, c.iz * CHUNK),
-      });
+      this.reasons[reason] = (this.reasons[reason] || 0) + 1;
+      this.queue.push({ ix: c.ix, iz: c.iz, k, cls: why < 0 ? FIX : SAVE });
       this.relodded++;
     }
   }
 
-  /** A neighbour's current resolution: its own answer if it is live, else ours. */
+  /** A neighbour's current resolution.  See `_stepOf`. */
   _neighbourStep(c, i) {
     const dx = i === 2 ? -1 : i === 3 ? 1 : 0;
     const dz = i === 0 ? -1 : i === 1 ? 1 : 0;
-    const n = this.live.get(ChunkField.key(c.ix + dx, c.iz + dz));
-    if (n) return n.want !== undefined ? n.want : n.step;
+    return this._stepOf(c.ix + dx, c.iz + dz);
+  }
+
+  /**
+   * The resolution a cell's edge is drawn at: what it *is* if it is live,
+   * what it will be built at if it is not.
+   *
+   * What it is, and not what it wants to be.  This returned `want` for a
+   * live chunk, so a chunk was stitched to its neighbour's *next* mesh
+   * for however long that neighbour's rebuild sat in the queue -- a seam
+   * that did not match either side, for a frame on a fast CPU and for
+   * seconds on a slow one.  `COARSE_FIRST` makes want and is differ on
+   * purpose, so it had to stop.  And `_build` asked `_lodFor` for every
+   * neighbour, live or not, which disagreed with this function whenever
+   * a live chunk's own road distance and the cache's did.
+   */
+  _stepOf(ix, iz) {
+    const n = this.live.get(ChunkField.key(ix, iz));
+    if (n) return n.step;
     /* A cell that is not live has no `dRoad` of its own, and asking the
      * road for one is five ring searches -- for every edge of every chunk
      * on the rim of the field, every frame.  That was 40 % of the CPU
      * profile of a drive, so it is remembered until the next scan. */
-    const ix = c.ix + dx, iz = c.iz + dz;
     return this._lodFor(ix * CHUNK, iz * CHUNK, this._cellRoadDist(ix, iz));
   }
 
@@ -555,7 +749,7 @@ export class ChunkField {
        * ground for however long the build queue takes, which is trading a
        * wrong hillside for no hillside. */
       this.pending.add(k);
-      this.queue.push({ ix: c.ix, iz: c.iz, k, d: -2 });
+      this.queue.push({ ix: c.ix, iz: c.iz, k, cls: FIX });
       this.invalidated++;
     }
     /* And the one being built right now, if it is inside the box: it is
@@ -567,11 +761,11 @@ export class ChunkField {
     }
   }
 
-  _request(ix, iz, d) {
+  _request(ix, iz) {
     const k = ChunkField.key(ix, iz);
     if (this.pending.has(k)) return;
     this.pending.add(k);
-    this.queue.push({ ix, iz, d, k });
+    this.queue.push({ ix, iz, k, cls: MISSING });
   }
 
   _retire(k, c) {
@@ -641,16 +835,40 @@ export class ChunkField {
   /** Spend at most `budgetMs` on construction, then stop mid-chunk. */
   _drain() {
     const t0 = performance.now();
-    while (performance.now() - t0 < this.budgetMs) {
+    const budget = this.holeNear ? Math.max(this.budgetMs, HOLE_BUDGET) : this.budgetMs;
+    while (performance.now() - t0 < budget) {
       if (!this.building) {
         const next = this.queue.shift();
-        if (!next) return;
+        if (!next) break;
         this.buildingAt = next;
-        this.building = this._build(next.ix, next.iz);
+        const coarse = next.cls === MISSING &&
+          this._carDist(next.ix * CHUNK, next.iz * CHUNK) < COARSE_FIRST ? 4 : 0;
+        this.building = this._build(next.ix, next.iz, coarse);
+        this._buildMs = 0;
       }
+      const a = performance.now();
       const r = this.building.next();
-      if (r.done) { this.building = null; this.buildingAt = null; }
+      this._buildMs += performance.now() - a;
+      if (r.done) {
+        this.building = null; this.buildingAt = null;
+        this._timed(this._lastStep, this._buildMs);
+      }
     }
+    this.drainMs = performance.now() - t0;
+  }
+
+  /** Main-thread milliseconds per chunk build, by step.  For `?debug`
+   *  and `perf-bench/void.mjs`: the whole question on a slow CPU is how
+   *  many of these a 4 ms slice can finish. */
+  _timed(step, ms) {
+    if (!step) return;
+    const t = this.buildTimes[step] || (this.buildTimes[step] = { n: 0, ms: 0 });
+    t.n++; t.ms += ms;
+  }
+
+  /** The live chunk under a world point, or undefined. */
+  chunkAt(x, z) {
+    return this.live.get(ChunkField.key(Math.floor(x / CHUNK), Math.floor(z / CHUNK)));
   }
 
   /* -------------------------------- water ------------------------------ */
@@ -748,12 +966,13 @@ export class ChunkField {
    * normal; done in one go that is a visible hitch, and the whole point of
    * the frame budget is that it never is.
    */
-  *_build(ix, iz) {
+  *_build(ix, iz, minStep = 0) {
     const T = this.terrain;
     const ox = ix * CHUNK, oz = iz * CHUNK;
 
     // resolution comes from the midline and from the car -- see `_lodFor`
-    const step = this._lodFor(ox, oz);
+    // -- unless the chunk is a hole being filled in a hurry (`COARSE_FIRST`)
+    const step = Math.max(minStep, this._lodFor(ox, oz));
     const dRoad = this._roadDist(ox, oz);
 
     /* Neighbour resolutions, so the edges can be stitched.  A neighbour can
@@ -764,17 +983,22 @@ export class ChunkField {
      * chosen neighbour steps are kept on the chunk and `_relod` rebuilds
      * whenever one of them changes.  Without that the seam it was stitched
      * to would move out from under it and open a crack. */
-    /* Through the same cache `_neighbourStep` reads, so the two agree:
-     * a fresh answer here against a remembered one there reads as a
-     * neighbour that changed, and rebuilds this chunk every frame until
-     * the cache turns over. */
+    /* Through the same function `_neighbourStep` reads, so the two
+     * agree: a fresh answer here against a remembered one there reads as
+     * a neighbour that changed, and rebuilds this chunk every frame until
+     * the cache turns over.
+     *
+     * Read at the *start* of a build that yields.  A neighbour rebuilt
+     * while this one is in flight is caught by `_relod` on the next pass,
+     * which compares these against `_neighbourStep`. */
     const nb = [
-      this._lodFor(ox, oz - CHUNK, this._cellRoadDist(ix, iz - 1)),   // -z
-      this._lodFor(ox, oz + CHUNK, this._cellRoadDist(ix, iz + 1)),   // +z
-      this._lodFor(ox - CHUNK, oz, this._cellRoadDist(ix - 1, iz)),   // -x
-      this._lodFor(ox + CHUNK, oz, this._cellRoadDist(ix + 1, iz)),   // +x
+      this._stepOf(ix, iz - 1),   // -z
+      this._stepOf(ix, iz + 1),   // +z
+      this._stepOf(ix - 1, iz),   // -x
+      this._stepOf(ix + 1, iz),   // +x
     ];
 
+    this._lastStep = step;
     const geo = this._take(step);
     const w = geo.userData.w;
     const pos = geo.attributes.position.array;
@@ -784,11 +1008,59 @@ export class ChunkField {
     const roadS = geo.attributes.roadS.array;
     const curv = geo.attributes.curv.array;
 
+    /* The landform on a grid of its own, `m` vertices wider than the
+     * chunk on every side, so the curvature's four neighbours are lookups
+     * rather than four more samples of the noise.
+     *
+     * That was most of the cost of a fine chunk, and on a slow CPU the
+     * cost of a fine chunk is the whole of `prompt_4.md`'s "my car would
+     * fall into the void": measured at a 6x CPU throttle, a 1 m chunk was
+     * 470 ms of main thread -- 62 % of it `curvatureAt`, five calls into
+     * the noise per vertex -- and the 4 ms slice could not keep up with
+     * the ground the car was driving onto.
+     *
+     * The curvature was a +/-5 m Laplacian and at 1 m it still is, exactly.
+     * At 2 m the nearest the lattice has is +/-6 m, so it is taken there
+     * and scaled by (5/6)^2, which is what a smooth field's Laplacian does
+     * with distance.  Coarser than 2 m it is not carried at all, as
+     * before. */
+    const fine = step <= 2;
+    const m = fine ? Math.round(5 / step) : 0;
+    const bw = w + 2 * m;
+    const base = this._baseGrid(bw * bw);
+    for (let j = 0; j < bw; j++) {
+      for (let i = 0; i < bw; i++) {
+        base[j * bw + i] = T.hm.base(ox + (i - m) * step, oz + (j - m) * step);
+      }
+      if ((j & 15) === 0) yield;
+    }
+    const curvScale = fine ? 0.02 * (5 / (m * step)) ** 2 : 0;
+
     const heights = this._takeHeights(step, w * w);
     for (let j = 0; j < w; j++) {
       for (let i = 0; i < w; i++) {
+        const k = j * w + i;
         const x = ox + i * step, z = oz + j * step;
-        heights[j * w + i] = T.heightAt(x, z);
+        const b = (j + m) * bw + (i + m);
+        heights[k] = T.heightAt(x, z, base[b]);
+
+        /* Where this vertex sits on the road, in road coordinates -- off
+         * the query `heightAt` has just made for the same point, which is
+         * the query `roadUV` would make.  See the second loop for what
+         * each of the three is for. */
+        const q = T.lastRoad;
+        if (q && q.d <= ROAD_QUERY) {
+          roadU[k] = q.u;
+          roadA[k] = Math.min(q.d, ROAD_OFF);
+          roadS[k] = q.s;
+        } else {
+          roadU[k] = ROAD_OFF;
+          roadA[k] = ROAD_OFF;
+          roadS[k] = 0;
+        }
+        curv[k] = fine
+          ? curvScale * ((base[b - m] + base[b + m] + base[b - m * bw] + base[b + m * bw]) / 4 - base[b])
+          : 0;
       }
       if ((j & 7) === 0) yield;
     }
@@ -811,23 +1083,17 @@ export class ChunkField {
         pos[k * 3 + 1] = y;
         pos[k * 3 + 2] = j * step;
 
-        // normals from the height field itself, so chunk edges agree
-        const hl = i > 0 ? heights[k - 1] : T.heightAt(x - step, z);
-        const hr = i < w - 1 ? heights[k + 1] : T.heightAt(x + step, z);
-        const hd = j > 0 ? heights[k - w] : T.heightAt(x, z - step);
-        const hu = j < w - 1 ? heights[k + w] : T.heightAt(x, z + step);
-        _v.set(hl - hr, 2 * step, hd - hu).normalize();
-        nor[k * 3] = _v.x; nor[k * 3 + 1] = _v.y; nor[k * 3 + 2] = _v.z;
+        vertexNormal(T, heights, w, step, i, j, x, z, nor);
 
-        /* Where this vertex sits on the road, in road coordinates.  The
-         * carriageway used to be a separate ribbon floating 9 cm over the
-         * ground; it lost the depth test at close range and won it in the
-         * distance, so the road appeared only beyond about eighty metres.
-         * Painted into the ground instead, it cannot z-fight with a
-         * surface it *is*. */
-        const q = T.roadUV(x, z);
-        roadU[k] = q ? q.u : ROAD_OFF;
-        /* The mask, and this is the one the shader reads.  Two reasons it
+        /* Where this vertex sits on the road, in road coordinates -- which
+         * the first loop has already written, off `heightAt`'s own query.
+         * The carriageway used to be a separate ribbon floating 9 cm over
+         * the ground; it lost the depth test at close range and won it in
+         * the distance, so the road appeared only beyond about eighty
+         * metres.  Painted into the ground instead, it cannot z-fight with
+         * a surface it *is*.
+         *
+         * `roadA`, the mask, and this is the one the shader reads.  Two reasons it
          * is a separate number rather than `abs( roadU )` in the shader:
          *
          * The signed offset crosses zero on any edge running from the left
@@ -846,18 +1112,16 @@ export class ChunkField {
          * offset paints a tongue of tarmac off the end of the road, which
          * is 1929 of the fabrications the probe still found after the sign
          * was dealt with.  Masking on distance ends the road in a rounded
-         * cap at the last node, which is where it ends. */
-        roadA[k] = q ? Math.min(q.d, ROAD_OFF) : ROAD_OFF;
-        roadS[k] = q ? q.s : 0;
-        /* Curvature is only worth sampling where it will be seen.  Four
-         * extra height calls per vertex triples the cost of a 1 m chunk,
-         * and at 8 m spacing the result is a 40 m Laplacian, which is not
-         * the quantity anyone wanted anyway. */
-        curv[k] = step <= 2 ? T.curvatureAt(x, z) : 0;
+         * cap at the last node, which is where it ends.
+         *
+         * `curv`, likewise written above, and only where it will be seen:
+         * at 8 m spacing it would be a 40 m Laplacian, which is not the
+         * quantity anyone wanted anyway. */
       }
       if ((j & 3) === 0) yield;
     }
 
+    writeSkirt(geo, w, step);
     const water = this._water(ox, oz, step, w, heights);
     yield;
 
@@ -926,12 +1190,70 @@ export class ChunkField {
      * against a road that has moved or arrived since, so go round again. */
     if (this.stale.delete(key)) {
       this.pending.add(key);
-      this.queue.push({ ix, iz, k: key, d: -2 });
+      this.queue.push({ ix, iz, k: key, cls: FIX });
       this.invalidated++;
     }
     this.built++;
     if (this.onChunk) this.onChunk(chunk);
   }
+}
+
+/**
+ * The index of the `t`-th vertex along edge `e` of a `w`-wide grid, in the
+ * order `stitchEdge` is called in: -z, +z, -x, +x.
+ */
+function edgeIndex(w, e, t) {
+  return e === 0 ? t : e === 1 ? (w - 1) * w + t : e === 2 ? t * w : t * w + (w - 1);
+}
+
+/**
+ * A skirt round the chunk: every edge vertex copied straight down.
+ *
+ * `prompt_4.md`: "the ground can still crack open from time to time, the
+ * background color would show".  Stitching is exact only while both
+ * sides of a seam agree about each other's resolution, and they cannot
+ * always: a chunk is stitched to its neighbour as it is *when it is
+ * built*, and the neighbour can be rebuilt before this one is restitched
+ * -- a frame on a fast CPU, longer on a slow one, and for as long as the
+ * queue is behind.  Every one of those windows is a sliver of sky.
+ *
+ * A skirt does not care why.  Each edge vertex has a twin `depth` metres
+ * below it, with the same normal and the same road attributes, so the
+ * strip between them shades as the edge does and fills any gap under it.
+ * Where the seam is closed the skirt is under the neighbour's ground and
+ * the depth test throws it away.  `depth` grows with the spacing because
+ * the error a stitch can be out by does: it is the ground's departure
+ * from a straight line over one of the coarser side's cells.
+ *
+ * The collider has no skirt -- it is built from `heights`, which this
+ * never touches -- and neither does the water.
+ */
+function writeSkirt(geo, w, step) {
+  const depth = 1 + 1.5 * step;
+  const at = geo.attributes;
+  const pos = at.position.array, nor = at.normal.array;
+  const lists = [at.roadU.array, at.roadA.array, at.roadS.array, at.curv.array];
+  for (let e = 0; e < 4; e++) {
+    for (let t = 0; t < w; t++) {
+      const k = edgeIndex(w, e, t), s = w * w + e * w + t;
+      pos[s * 3] = pos[k * 3];
+      pos[s * 3 + 1] = pos[k * 3 + 1] - depth;
+      pos[s * 3 + 2] = pos[k * 3 + 2];
+      nor[s * 3] = nor[k * 3]; nor[s * 3 + 1] = nor[k * 3 + 1]; nor[s * 3 + 2] = nor[k * 3 + 2];
+      for (const a of lists) a[s] = a[k];
+    }
+  }
+}
+
+/** Normals from the height field itself, so chunk edges agree. */
+function vertexNormal(T, heights, w, step, i, j, x, z, nor) {
+  const k = j * w + i;
+  const hl = i > 0 ? heights[k - 1] : T.heightAt(x - step, z);
+  const hr = i < w - 1 ? heights[k + 1] : T.heightAt(x + step, z);
+  const hd = j > 0 ? heights[k - w] : T.heightAt(x, z - step);
+  const hu = j < w - 1 ? heights[k + w] : T.heightAt(x, z + step);
+  _v.set(hl - hr, 2 * step, hd - hu).normalize();
+  nor[k * 3] = _v.x; nor[k * 3 + 1] = _v.y; nor[k * 3 + 2] = _v.z;
 }
 
 /**

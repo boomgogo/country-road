@@ -311,6 +311,24 @@
       .load-choices i { display: block; font-style: normal; font-size: 9px;
                         letter-spacing: .20em; opacity: .55; padding-top: 5px; }
       .load.gone { opacity: 0; pointer-events: none; }
+      /* The way to the source.  Text in the overlay's own type rather than
+         the classic ribbon image: no request, no bytes, and it sits in the
+         one element that is both the load screen and the pause menu. */
+      .fork {
+        position: absolute; top: 0; right: 0;
+        padding: 14px 16px; font-size: 10px; letter-spacing: .28em;
+        color: #f2f5f7; opacity: .6; text-decoration: none;
+        border-left: 1px solid rgba(255,255,255,.22);
+        border-bottom: 1px solid rgba(255,255,255,.22);
+      }
+      .fork:hover, .fork:focus { opacity: 1; background: rgba(255,255,255,.10); outline: none; }
+      /* On a phone the corner is where the thumb is not, and where a notch
+         may be; the bottom edge is clear of both. */
+      @media (pointer: coarse) {
+        .fork { top: auto; bottom: max(0px, env(safe-area-inset-bottom));
+                right: 50%; transform: translateX(50%);
+                border: 1px solid rgba(255,255,255,.22); border-bottom: 0; }
+      }
     </style>
   </head>
   <body>
@@ -327,6 +345,8 @@
         <button id="load-continue" type="button"><b>continue</b><i id="load-where"></i></button>
         <button id="load-new" type="button"><b>new drive</b><i>fresh start</i></button>
       </div>
+      <a class="fork" id="load-fork" href="https://github.com/boomgogo/country-road"
+         target="_blank" rel="noopener">fork me on github</a>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

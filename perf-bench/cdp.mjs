@@ -1,14 +1,20 @@
 import { spawn } from 'node:child_process';
 const HEADLESS = process.env.HEADLESS === '1';
-const port = 9333;
-export async function launch({ w = 1920, h = 1080 } = {}) {
-  const args = [`--remote-debugging-port=${port}`, `--user-data-dir=${process.cwd()}/chrome-prof`,
+/* `port` and `profile` so two harnesses can run at once -- the film takes
+ * hours, and the probes should not have to wait for it.  `env` is added
+ * to Chrome's environment, which is how the film asks for the discrete
+ * GPU on a hybrid-graphics laptop. */
+export async function launch({ w = 1920, h = 1080, port = 9333, profile = `${process.cwd()}/chrome-prof`,
+                               env = {}, args: extra = [] } = {}) {
+  const args = [`--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check', `--window-size=${w},${h}`, '--window-position=0,0',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'];
   if (HEADLESS) args.push('--headless=new', '--enable-gpu', '--use-angle=gl');
   if (process.env.CHROME_ARGS) args.push(...process.env.CHROME_ARGS.split(' '));
-  const proc = spawn('google-chrome', [...args, 'about:blank'], { stdio: 'ignore' });
+  args.push(...extra);
+  const proc = spawn('google-chrome', [...args, 'about:blank'],
+                     { stdio: 'ignore', env: { ...process.env, ...env } });
   let ver;
   for (let i = 0; i < 50; i++) {
     try { ver = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json(); if (ver.find(t => t.type === 'page')) break; } catch {}
@@ -27,5 +33,5 @@ export async function launch({ w = 1920, h = 1080 } = {}) {
   };
   await send('Runtime.enable');
   listeners.push(d => { if (d.method === 'Runtime.consoleAPICalled' && process.env.LOGS) console.log('[page]', d.params.args.map(a => a.value ?? a.description).join(' ')); if (d.method === 'Runtime.exceptionThrown') console.log('[exc]', JSON.stringify(d.params.exceptionDetails).slice(0, 500)); });
-  return { send, evaluate, close: () => { ws.close(); proc.kill(); } };
+  return { send, evaluate, on: (f) => listeners.push(f), close: () => { ws.close(); proc.kill(); } };
 }

@@ -85,9 +85,11 @@ export class Physics {
       if (!c.heights) continue;
       if (boxDist(x, z, c.ix * CHUNK, c.iz * CHUNK, CHUNK) > this.radius) continue;
       const have = this.terrain.get(k);
-      if (have && have.chunk === c) continue;
+      /* And revision: `ChunkField._restitch` rewrites a chunk's edge rows
+       * in place, which is the same chunk with different heights. */
+      if (have && have.chunk === c && have.rev === c.rev) continue;
       if (have) this.world.removeCollider(have.collider, false);
-      this.terrain.set(k, { chunk: c, collider: this._heightfield(c) });
+      this.terrain.set(k, { chunk: c, rev: c.rev, collider: this._heightfield(c) });
     }
 
     /* Drop what has gone out of range or out of existence.  The hysteresis

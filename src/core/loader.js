@@ -100,6 +100,7 @@ export class Loader {
     this.fillEl = document.getElementById('load-fill');
     this.choices = document.getElementById('load-choices');
     this.whereEl = document.getElementById('load-where');
+    this.fork = document.getElementById('load-fork');
 
     /* Any of the three, because the player whose instinct is to press W
      * should be driving rather than being told to use the mouse.
@@ -133,6 +134,10 @@ export class Loader {
        * the ways to suppress the `click` that follows it, which would have
        * replaced the bug with a quieter one. */
       if (e.target && this.choices && this.choices.contains(e.target)) return;
+      /* And so does the link to the source, for the same reason and on
+       * the keyboard too: Enter on a focused link must open the link and
+       * nothing else, not open it *and* start the drive behind it. */
+      if (e.target && this.fork && this.fork.contains(e.target)) return;
       /* With a save offered, the buttons are the only way through: a
        * stray key must not silently pick one of the two for the player.
        * `N` is the keyboard's half of "new drive" -- without it a player

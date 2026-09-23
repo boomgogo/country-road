@@ -435,12 +435,21 @@ export class Terrain {
    * The rounding is the only cosmetic part, and it earns its place: a
    * batter that meets the hillside at a hard crease reads as folded paper.
    */
-  heightAt(x, z) {
-    const h = this.hm.base(x, z);
+  heightAt(x, z, h = this.hm.base(x, z)) {
+    /* `h` may be handed in: the chunk mesher samples the landform on a
+     * grid of its own, for the curvature, and would otherwise pay for
+     * every vertex's base twice.  See `ChunkField._build`.
+     *
+     * `lastRoad` is the nearest-road answer this call used, or null --
+     * the same answer `roadUV` would give for the same point, and the
+     * mesher wants both.  It is `_q`, shared, so it is good until the
+     * next call into this file and no longer. */
+    this.lastRoad = null;
     if (!this.road) return h;
 
     const q = this.road.nearest(x, z, _q);
     if (!q) return h;
+    this.lastRoad = q;
 
     const w = platform(q);
     const road = q.y + crown(q.d, w);

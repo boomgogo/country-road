@@ -63,6 +63,12 @@ the production build always draws cel.
 far it is from the car — a diagnostic for the ink on the verge, and an
 expensive one: it is the case `FAR_LOD` exists to prevent.
 `?car=coupe` keeps the code-built stand-in instead of the modelled car.
+`?auto` starts with full autodrive (`?auto=steer`, `?auto=speed` for the
+others) and skips the load screen.
+`?debug=1` puts a few lines top left: the tier and GPU, the screen's density,
+the canvas and scene sizes and which route the picture took to the screen,
+the frame rate and the governor's level, and whether the ground is keeping
+up with the car. It is the thing to screenshot when a device looks wrong.
 
 `?t=18:20`, `?season=autumn`, `?weather=heavyRain` and `?day=7` pin the sky, and
 they are useful for screenshots — with a 24-minute day and hourly weather, a
@@ -78,4 +84,32 @@ calendar is fixed, so a first thirty seconds is the same first thirty seconds.
 
 ---
 
+## Playing it from a script
+
+Both need the dev server (`npm run dev`) and Google Chrome.
+
+```bash
+node tools/play/autoplay.mjs --minutes 20             # play, and check it all works
+node tools/play/autoplay.mjs --realtime --throttle 4 --quality low
+node tools/play/film.mjs --survey country,drift,hills # 48 hours of weather per seed
+node tools/play/film.mjs --seed country --hours 48 --out /media/DRIVE2/country-road/two-days
+node tools/play/check-mp4.mjs <film.mp4>              # does it decode; frames as PNG
+```
+
+`autoplay.mjs` plays with the keys a player has: autodrive, the cameras, a
+nudge of the wheel, the handbrake, off into a field and `T`, the part-auto
+modes, the clock, a rest through the night. Every action is checked, and so
+is every few seconds of driving — off the road under the autopilot, stuck,
+fallen through the ground, no ground, an exception. A minute of play is a
+game-hour. Exits non-zero on any failure.
+
+`film.mjs` records one continuous drive: every frame stepped, encoded to
+H.264 in the page by WebCodecs and muxed to MP4 in Node, with an 8x
+time-lapse made from the same frames in the same pass. No ffmpeg needed.
+About 11 frames a second on an Intel HD 630, so two game-days is two hours.
+
+The probes behind `prompt_4.md`'s fixes are in `perf-bench/`: `dpr.mjs` (what
+reaches the panel on a high-density screen), `void.mjs` (does the ground keep
+up on a throttled CPU), `seam.mjs` (holes in the ground, counted),
+`far.mjs` (the world a long way from the origin).
 
