@@ -9,5 +9,7 @@
         - The terrain can fail to generate at times and my car would fall into the void
     - the ground can still crack open from time to time, the background color would show
         - It did not affect driving though
+5. Add a "fork me on github" link on the loading and esc / pause screen
+
 
 
