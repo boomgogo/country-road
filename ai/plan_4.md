@@ -1,15 +1,17 @@
-# plan_4 — a drive through a whole year, and what it shows
+# plan_4 — a two-day drive, and what it shows
 
 Answers `ai/prompt_4.md`.  Five items, and they depend on each other
 more than the numbering suggests:
 
 * **1 (the autoplayer) and 2 (the film)** are one piece of tooling.  The
   film is the autoplayer with a camera on it.
-* **The film is also the best test this project has had.**  4.8 hours of
-  continuous drive covers every season, every weather and every hour.  It
-  also covers 345 km of road, which is further than any probe has ever
-  driven.  Anything item 4 asks about that is not specific to one device
-  should show up in it.
+* **The film is also the best test this project has had.**  48 minutes
+  of continuous drive covers two full days and nights, about 48 hourly
+  weather draws, and about 58 km of road.  That is further and longer
+  than any probe has driven without a teleport.  Anything item 4 asks
+  about that is not specific to one device should show up in it.  It
+  does **not** cover the seasons: a season is 3 game-days, so the whole
+  film is spring.
 * **3 (make it more fun)** is written *after* the drive, from what the
   drive showed, and not before.
 * **4 (bugs)** has three reports, and each has a cause I can name from
@@ -18,8 +20,8 @@ more than the numbering suggests:
 * **5 (fork-me link)** is independent and small.
 
 Order of work: **5 → 4a (blur) → 4b/4c (void, cracks) → 1 → 2 → 3**.
-The bugs go before the film because a four-hour film of a known crack is
-four hours of recording thrown away.  The autoplayer's first short runs
+The bugs go before the film because a film of a known crack has to be
+rendered again once the crack is fixed.  The autoplayer's first short runs
 are the soak test the bug fixes need anyway.
 
 ---
@@ -248,23 +250,24 @@ Acceptance: zero magenta pixels in the seam probe at 1× and 4×, and
 ## 4d. What the film itself will be watched for
 
 The film is also a probe.  Two risks follow from the length of the
-drive, and this plan does not know the answer to either yet:
+drive:
 
-* **Float precision at 345 km.**  Rapier is f32, and so are the
-  instanced matrices, the road and furniture vertices, and every shader
-  that reads a world position (ground texture coordinates, noise).  At
-  2^18 m a float32 step is 3 cm.  Before the film, `perf-bench/far.mjs`
-  jumps to s = 100, 200 and 345 km of arc and records the car's actual
-  xz distance from the origin (the road winds, so it may be much less
-  than arc length).  At each point it checks for: suspension jitter
-  (variance of `car.wheelY` on straight road), shimmer in the ground
-  texture, and jitter in the trees.  If any of these is visible, a
-  floating origin (rebase the world every few km) becomes its own
-  item, the film waits for it, and the player gets the fix too: a long
-  resumed drive reaches the same distances.
+* **Float precision.**  Rapier is f32, and so are the instanced
+  matrices, the road and furniture vertices, and every shader that reads
+  a world position (ground texture coordinates, noise).  At the film's
+  ~58 km of arc the car is at most 2^16 m from the origin, where a
+  float32 step is under 1 cm.  That is probably fine, and it is no
+  longer a blocker for the film.  It is still worth one cheap check,
+  because a player's resumed drive can go much further than the film:
+  `perf-bench/far.mjs` jumps to s = 60, 150 and 300 km and looks for
+  suspension jitter (variance of `car.wheelY` on straight road),
+  shimmer in the ground texture, and jitter in the trees.  If it finds
+  any, a floating origin goes into `next_4.md` as its own item.  It does
+  not go into this plan.
 * **Leaks.**  The film logs JS heap size, `renderer.info` (geometries,
   textures, programs) and the live and pooled chunk counts every
-  game-hour.  Anything that grows without bound over 4.8 h is a bug.
+  game-hour.  Anything that is still growing at the end of day two is a
+  bug.
 
 ---
 
@@ -302,16 +305,16 @@ says one continuous drive, and a rest is a cut in everything but name.
 
 # Item 2 — the film
 
-**Length.**  A game year is `YEAR` = 17 280 s of game time, and the clock
-runs at one game second per real second.  So "a whole year without a
-cut" is **4 h 48 min of film** at game speed.  That is the master.
+**Length.**  A game-day is `DAY` = 1 440 s, and the clock runs at one
+game second per real second.  So two game-days without a cut is
+2 880 s: **48 minutes of film**, 86 400 frames at 30 fps.
 
 **How it is made.**  Frames are stepped, not screen-recorded:
 `step(1/30)` then a frame readback.  So the film is the same film
 every time, and it does not depend on the machine keeping up.
 
-* **Readback:** `grab()` gives a PNG data URL, and 518 400 PNG
-  encodes plus base64 over CDP is too slow.  Add a `grabRaw()` that
+* **Readback:** `grab()` gives a PNG data URL, and 86 400 PNG encodes
+  plus base64 over CDP is too slow.  Add a `grabRaw()` that
   `readPixels` into a reused buffer (keeping `grab()`'s cleared-buffer
   check and `finish()`), then either:
   * send the raw RGBA frames to the recorder over a local binary
@@ -320,42 +323,40 @@ every time, and it does not depend on the machine keeping up.
     encoded chunks cross to Node.
 
   Which of the two depends on a 2-minute benchmark of each.  The target
-  is at least 15 frames/s of wall clock, which makes the master about
-  10 hours to render.
+  is at least 15 frames/s of wall clock, which makes the film about
+  **1.6 hours to render**.
 * **Encode:** Node pipes into `ffmpeg` (NVENC on the GTX 1050 in this
   machine if the in-page route loses; `libx264 -crf 18` otherwise).
   1920×1080, 30 fps, `high` tier (which `?rec` already forces).
-* **Resumable without a cut.**  A 10-hour job will be interrupted.  The
-  recorder writes 10-minute segments with frame-exact boundaries, and
-  also writes a **state checkpoint** at each boundary (clock, weather
-  state, road, car pose and velocity, RNG positions, autodrive state).
-  That lets a crash resume from the last segment.  The segments are
-  joined with ffmpeg's concat demuxer, `-c copy`, so the joined file has
-  no gap and no re-encode.  Before relying on this, test it: render
-  segment N twice, once straight through and once resumed from its
-  checkpoint, and diff them.  If they are not bit-identical, the
-  checkpoint is missing state.  Fix that, or fall back to one
-  uninterrupted run.
-* **Deliverables in `/media/DRIVE2/country-road/year/`:**
-  * `year-master-1080p30.mp4` — 4 h 48 min, the whole year, one take
-  * `year-timelapse-16x.mp4` — made *from* the master with ffmpeg
-    frame selection: 18 min, still continuous, no cuts, just faster.
-    This is the one anyone will actually watch.
-  * `segments/`, `checkpoints/`, `log.jsonl` (the autoplayer's log for
-    the whole drive), `contact-sheet.png` (one frame per game-hour, 288
-    tiles), `README.md` (seed, commit, flags, render time, grab retries)
+* **One uninterrupted run.**  At 1.6 hours, a crash means starting
+  again, which is cheaper than building checkpoint and resume and then
+  proving that a resumed segment is bit-identical to a straight one.
+  The recorder still writes the ffmpeg output as it goes and keeps the
+  log, so a failed run shows where and why it failed.  If the benchmark
+  comes in far under 15 frames/s (a render over about 5 hours), then
+  checkpointing comes back into scope.
+* **Deliverables in `/media/DRIVE2/country-road/two-days/`:**
+  * `two-days-1080p30.mp4`: 48 min, one take
+  * `two-days-timelapse-8x.mp4`: made *from* the master with ffmpeg
+    frame selection, 6 min, still continuous with no cuts, just faster
+  * `log.jsonl` (the autoplayer's log for the whole drive),
+    `contact-sheet.png` (one frame per game-hour, 48 tiles), and
+    `README.md` (seed, commit, flags, render time, grab retries)
   * Nothing from this goes in the repo.  Only the scripts do.
-* **Start:** day 1 spring 08:00 is where every drive starts, and it
-  runs to day 1 spring 08:00 of the next year.  Spring → summer →
-  autumn → winter → spring.
+* **Start:** day 1, spring, 08:00, which is where every drive starts.
+  The film runs to day 3, 08:00: two sunrises, two sunsets, two nights.
+* **Weather:** it is seeded, so pick the seed from a quick survey of
+  several seeds' first 48 game-hours of weather (the draw is cheap and
+  needs no rendering).  Choose one that includes rain and a clear
+  night, so the film shows more than one sky.  Put the seed in the
+  README.
 * **No audio.**  The engine is an AudioWorklet driven by the real-time
   clock.  Under stepped frames it would need an offline render of the
-  whole 4.8 h in step with the video, which is out of scope here.  Say
-  so in the README.
+  whole 48 minutes in step with the video, which is out of scope here.
+  Say so in the README.
 
-**Dry runs before the real one:** one game-hour (2 min of film), then
-one game-day (24 min), each watched at speed.  Then the §4d far-distance
-check.  Then the year.
+**Dry runs before the real one:** one game-hour (1 min of film), then
+six game-hours (6 min), each watched at speed.  Then the film.
 
 ---
 
@@ -375,10 +376,12 @@ What to look for, so it is measured rather than asserted:
   hitch-hiker, a fuel stop), a radio, collectables tied to seasons,
   challenge routes on a shared seed, and a "postcard" share from the
   pause screen.
-* **What the drive itself sells.**  The year cycle is unique; nothing
-  else lets you drive through four seasons in one sitting.  Consider
-  what would make a player *notice* a season changing, rather than
-  finding out from the HUD text.
+* **What the drive itself sells.**  The day and night cycle and the
+  weather are what two days show.  The seasons are not in the film (it
+  is all spring), so before writing about them, drive a few minutes of
+  each with `?season=`.  Also consider whether 3 game-days (72 minutes)
+  per season is too long for a typical sitting to see even one change.
+  That is a question for the user to decide, not for this plan.
 * Each suggestion gets a cost against the spec, both the 2–3 s first
   load and entry-level phones.
 
@@ -402,7 +405,7 @@ Ranked, with the top three argued in more detail.
 | `index.html`, `src/core/loader.js` | §5 link, and its event guard |
 | `src/core/post.js`, `src/core/quality.js`, `src/main.js` | §4a output resolution, output-res ink, sharpen, governor |
 | `src/world/chunks.js`, `src/main.js`, `src/car/physics.js` | §4b priorities, coarse-first, adaptive budget, net; §4c skirts |
-| `src/main.js` | `?debug=1`, `grabRaw()`, checkpoint save/restore |
+| `src/main.js` | `?debug=1`, `grabRaw()` |
 | `tools/play/autoplay.mjs`, `tools/play/film.mjs` | items 1 and 2 |
 | `perf-bench/void.mjs`, `seam.mjs`, `far.mjs` | §4b, §4c, §4d |
 | `README.md` | `?debug`, the link, the tools |
