@@ -113,3 +113,8 @@ reaches the panel on a high-density screen), `void.mjs` (does the ground keep
 up on a throttled CPU), `seam.mjs` (holes in the ground, counted),
 `far.mjs` (the world a long way from the origin).
 
+
+## Credit
+
+Inspired by [Slowroads.io](https://slowroads.io/)
+
