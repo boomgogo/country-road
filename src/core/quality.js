@@ -44,6 +44,9 @@ import { FAR_LOD } from '../world/chunks.js';
  *   rather than cloud.  The knob is here for the device that proves that
  *   wrong.
  * @property {object[]} farLod   see `FAR_LOD`
+ * @property {number} lamps      how many lamps' pools the lit materials add
+ *   at night, of `lamps.js`'s eight.  Each is a distance test per fragment
+ *   on the ground, and a phone's fill rate is what a town at night spends.
  * @property {number} downFps    the governor steps the scene down below this
  * @property {number} upFps      and considers stepping up above this
  */
@@ -58,7 +61,7 @@ export const TIERS = {
     anisotropy: 16, shadowMap: 3072,
     cloudScale: 0.5, cloudHistory: 1,
     cloudCount: 420, cloudDetail: 1,
-    farLod: FAR_LOD.high,
+    farLod: FAR_LOD.high, lamps: 8,
     downFps: 48, upFps: 56,
   },
   /* Integrated graphics.  No supersample to start with, and the governor
@@ -78,7 +81,7 @@ export const TIERS = {
     anisotropy: 4, shadowMap: 2048,
     cloudScale: 0.3, cloudHistory: 0.5,
     cloudCount: 300, cloudDetail: 1,
-    farLod: FAR_LOD.medium,
+    farLod: FAR_LOD.medium, lamps: 8,
     downFps: 40, upFps: 50,
   },
   /* Phones.  The scale and the shadow map are what `?quality=low` already
@@ -90,7 +93,7 @@ export const TIERS = {
     anisotropy: 2, shadowMap: 1536,
     cloudScale: 0.3, cloudHistory: 0.5,
     cloudCount: 200, cloudDetail: 1,
-    farLod: FAR_LOD.low,
+    farLod: FAR_LOD.low, lamps: 4,
     downFps: 36, upFps: 45,
   },
 };

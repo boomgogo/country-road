@@ -201,8 +201,63 @@ const CLUSTER_H = 1.35;
  * taller than it is wide however thick the field says the deck is.
  */
 const VERT_MIN = 0.86, VERT_MAX = 1.15;
-/** How far a lobe may lean, radians, peak to peak.  See `_place`. */
+/** How far a lobe may lean, radians, peak to peak.  See `_write`. */
 const TILT = 0.5;
+
+/* ------------------------------------------------------------------ *
+ * How the set moves, and `prompt_5.md` issue 2.
+ *
+ * "The cloud seems to be stationary for a while and then suddenly jumps
+ * to the next state."  It was, and it was not a saving: the instances are
+ * drawn every frame whatever happens.  What was being saved was the CPU
+ * scan, and the way it was skipped is what froze the sky.  Every cloud sat
+ * on a grid fixed to the *ground* while the field drifted under it at
+ * 9 m/s, and the set was only re-decided after 240 m of drift -- every 27
+ * seconds parked.  In between, nothing moved; at each rebuild every cell
+ * the field had crossed popped in or out and every survivor changed size.
+ * And because the ground shadows come from the same field on the GPU and
+ * *do* move every frame, a cloud and its own shadow walked apart for half
+ * a minute and then snapped back together.
+ *
+ * Now the grid is in the **field's** frame.  A cell's centre is fixed
+ * in field coordinates, its world position is that minus the drift, and
+ * the field is a rigid translation (`rawAt` puts the same offset on both
+ * of its scales) -- so a cloud's field value is constant for as long as
+ * it exists, and the drift alone can never pop one.  The mesh is moved by
+ * the drift every frame, which is one matrix, and the clouds move at the
+ * wind's speed exactly with their shadows.
+ *
+ * What a rebuild can still change is what crosses the edge of the range,
+ * what crosses a ring boundary (where the cell size changes), what the
+ * nearest-first budget lets in, and the cut while the weather changes.
+ * Those grow in and shrink out over `GROW` seconds instead of popping.
+ * ------------------------------------------------------------------ */
+
+/** Seconds a cluster takes to form, or to dissolve. */
+const GROW = 8;
+/** Metres either side of a ring boundary a cluster keeps its ring, so a
+ *  cell sitting on the line does not swap rings at every rebuild. */
+const HYST = 300;
+/** Room in the buffers for clusters that are dissolving, as a fraction
+ *  over the live budget -- so the fades never take sky from the live set. */
+const SLACK = 0.3;
+/** Metres of eye movement, in the field's frame, before a rescan. */
+const REBUILD = 240;
+/** Cells scanned per frame.  The scan is about 1 800 cells and three field
+ *  taps each, which is 3.7 ms here and several times that on a phone --
+ *  so it is spread over a few frames, and the old set, which is still
+ *  right, keeps drifting until the new one is ready. */
+const CELLS_PER_FRAME = 320;
+/** Drift (or eye movement) in one frame past which the clock or the car
+ *  has jumped rather than moved -- a rest, a scrub, a teleport -- and the
+ *  layer rebuilds at once with nothing fading.  Driving moves the eye
+ *  about a metre a frame and the drift a third of one. */
+const JUMP_OFS = 60;
+const JUMP_EYE = 100;
+/** Metres of drift before the frame the lobes are written in is moved, and
+ *  every cluster rewritten.  An hour of wind; far enough that it is rare,
+ *  near enough that the offsets stay small for a float. */
+const REBASE = 30000;
 
 /**
  * Where lobe `i` of cloud `seed` sits and how big it is, **all four in
@@ -292,25 +347,49 @@ function lobe(seed, i, out) {
 const LOBE_VERT = /* glsl */ `
   attribute vec2 aCloud;       // the cluster's middle height, and 1 / its half-height
   attribute float aFade;       // 0 at the range boundary, 1 up close
+  attribute vec2 aGrow;        // when the cluster was born and when it dies, layer seconds
+  attribute vec3 aHub;         // the middle of the cluster's base, mesh space
+  uniform float uTime;         // the layer's own clock, seconds
   varying vec3 vOrigin;        // the eye, in the lobe's unit-sphere space
   varying vec3 vDir;           // the view ray, likewise
   varying vec4 vRel;           // xyz: hull point - eye, world.  w: aFade
   varying mat3 vRot;           // unit-sphere space -> world, rotation only
   varying vec3 vScl;           // the lobe's three radii, world metres
-  varying vec2 vCloud;         // aCloud, straight through
+  varying vec2 vCloud;         // aCloud, grown, in world height
 
   void main() {
+    /* How far formed this cluster is.  A cloud the scan has just found
+     * grows out of its own base over GROW seconds, and one it has just lost
+     * shrinks back into it -- which is what a cumulus forming and
+     * dissolving looks like, and is the alternative to it appearing in a
+     * single frame.  See CloudGeo._commit. */
+    float g = smoothstep( aGrow.x, aGrow.x + ${GROW.toFixed(1)}, uTime )
+      * ( 1.0 - smoothstep( aGrow.y, aGrow.y + ${GROW.toFixed(1)}, uTime ) );
+    if ( g < 0.02 ) {
+      /* Off the clip volume entirely.  A lobe of zero size would divide by
+       * its own radii below. */
+      gl_Position = vec4( 2.0, 2.0, 2.0, 1.0 );
+      return;
+    }
+    /* Scaled about the hub: the lobe's own axes by g, and its offset from
+     * the base of the cluster by g, so the whole cluster grows as one. */
+    mat4 inst = instanceMatrix;
+    inst[ 0 ].xyz *= g;
+    inst[ 1 ].xyz *= g;
+    inst[ 2 ].xyz *= g;
+    inst[ 3 ].xyz = aHub + ( inst[ 3 ].xyz - aHub ) * g;
+
     /* The instance matrix is compose( position, quaternion, scale ) with a
      * non-uniform scale, so its upper 3x3 is R * S with S diagonal.  That
      * factorisation is the only reason any of this is cheap: the inverse
      * is S^-1 * R^T, which is three dot products and a divide, and no
      * general 3x3 inverse is ever formed. */
-    mat3 W = mat3( modelMatrix ) * mat3( instanceMatrix );
+    mat3 W = mat3( modelMatrix ) * mat3( inst );
     vec3 sc = vec3( length( W[ 0 ] ), length( W[ 1 ] ), length( W[ 2 ] ) );
     mat3 R = mat3( W[ 0 ] / sc.x, W[ 1 ] / sc.y, W[ 2 ] / sc.z );
 
-    vec4 wp = modelMatrix * instanceMatrix * vec4( position, 1.0 );
-    vec3 ctr = ( modelMatrix * instanceMatrix * vec4( 0.0, 0.0, 0.0, 1.0 ) ).xyz;
+    vec4 wp = modelMatrix * inst * vec4( position, 1.0 );
+    vec3 ctr = ( modelMatrix * inst * vec4( 0.0, 0.0, 0.0, 1.0 ) ).xyz;
 
     /* R^T * v, written out: R[ i ] is a *column*, so the dots are the
      * rows of the transpose.  GLSL ES 1.00 has no transpose() and this
@@ -330,7 +409,11 @@ const LOBE_VERT = /* glsl */ `
     vRel = vec4( rel, aFade );
     vRot = R;
     vScl = sc;
-    vCloud = aCloud;
+    /* The base shading measures height within the cluster, so the middle
+     * and the half-height grow with it -- and the middle is in world
+     * height, which is the mesh's own offset on top of mesh space. */
+    vCloud = vec2( aHub.y + ( aCloud.x - aHub.y ) * g + modelMatrix[ 3 ][ 1 ],
+                   aCloud.y / g );
     gl_Position = projectionMatrix * viewMatrix * wp;
   }
 `;
@@ -704,6 +787,7 @@ export class CloudGeo {
          * for the vertex stage only, and the ellipsoid's depth is worked
          * out in the fragment stage.  See `LOBE_FRAG`. */
         uProj: { value: new THREE.Matrix4() },
+        uTime: { value: 0 },
       },
       vertexShader: LOBE_VERT,
       fragmentShader: LOBE_FRAG,
@@ -712,14 +796,20 @@ export class CloudGeo {
     });
 
     const geo = proxyGeometry(detail);
-    this.mesh = new THREE.InstancedMesh(geo, this.mat, this.max * LOBES);
+    /* The live budget plus room for what is dissolving.  See `SLACK`. */
+    const n = Math.ceil(this.max * LOBES * (1 + SLACK));
+    this.cap = n;
+    this.mesh = new THREE.InstancedMesh(geo, this.mat, n);
     this.mesh.frustumCulled = false;
     this.mesh.count = 0;
-    const n = this.max * LOBES;
     this.aCloud = new THREE.InstancedBufferAttribute(new Float32Array(n * 2), 2);
     this.aFade = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
+    this.aGrow = new THREE.InstancedBufferAttribute(new Float32Array(n * 2), 2);
+    this.aHub = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
     geo.setAttribute('aCloud', this.aCloud);
     geo.setAttribute('aFade', this.aFade);
+    geo.setAttribute('aGrow', this.aGrow);
+    geo.setAttribute('aHub', this.aHub);
     this.scene.add(this.mesh);
 
     this.sky = new THREE.ShaderMaterial({
@@ -797,11 +887,27 @@ export class CloudGeo {
     });
     this.composite.material.uniforms.tCloud.value = this.out.texture;
 
-    /** Where the field was when the instances were last built. */
-    this._at = new THREE.Vector3(NaN, NaN, NaN);
-    this._ofs = new THREE.Vector2(NaN, NaN);
+    /** Where the eye was, in the field's frame, at the last scan; and the
+     *  cut it was made at. */
+    this._at = new THREE.Vector2(NaN, NaN);
     this._cut = NaN;
+    /** The drift and the eye height the instance matrices are written
+     *  against.  The mesh is offset from these every frame. */
+    this._ref = { x: 0, z: 0, y: 0 };
+    /** Last frame's drift and eye, for telling a jump from a move. */
+    this._lastOfs = new THREE.Vector2(NaN, NaN);
+    this._lastEye = new THREE.Vector3(NaN, NaN, NaN);
+    this._lastT = NaN;
+    /** The layer's own clock: game seconds, never backwards, never more
+     *  than a fraction of a second a frame -- so a fade takes the same
+     *  time in a film, in a drive and after a pause. */
+    this.time = 0;
+    /** Every cluster drawn or dissolving, by cell.  See `_commit`. */
+    this.recs = new Map();
+    /** The scan in progress, or null.  See `_scan`. */
+    this.job = null;
     this.count = 0;
+    this.rebuilds = 0;
     this._dayInk = new THREE.Color(PAL.ink);
     this._prevClear = new THREE.Color();
     /** Candidate clouds, reused: a rebuild sorts them and keeps the
@@ -821,9 +927,10 @@ export class CloudGeo {
     this.sky.uniforms.uThickness.value = 1 + 0.5 * Math.min(2, rw / 1280);
   }
 
-  /** Nothing is accumulated, so there is nothing to forget.  Kept so the
-   *  governor and the recorder can call the same method on either layer. */
-  reset() { this._at.set(NaN, NaN, NaN); }
+  /** Start again from nothing: the next frame rescans at once, with no
+   *  fades.  Kept so the governor and the recorder can call the same method
+   *  on either layer. */
+  reset() { this._at.set(NaN, NaN); this.job = null; }
 
   /**
    * Colours for this frame, and the cloud set if it has moved on.
@@ -892,178 +999,381 @@ export class CloudGeo {
      * which is the whole reason it lives here and not in the constructor. */
     u.uProj.value.copy(c.projectionMatrix);
 
-    this._place(camera.position);
+    this._move(camera.position, clock);
   }
 
   /**
-   * Rebuild the instance set, when it is worth rebuilding.
+   * Once a frame: the clock, the drift, and the scan if one is due.
    *
-   * Placement is a pure function of (the field, the drift, where the
-   * camera is), so a rebuild produces the same clouds in the same places
-   * and nothing pops except at the range boundary -- which is why the
-   * boundary is out where a cloud is already the colour of the sky.
-   *
-   * The threshold is in metres of camera movement rather than in frames
-   * because that is what actually changes the answer: at 30 m/s a 240 m
-   * step is eight seconds, and the near ring's cells are 470 m across.
-   * The cut gets a tolerance of its own -- it moves continuously while
-   * the weather blends, and without one every frame of a change would be
-   * a full rescan.
+   * A *jump* -- the drift or the eye moving further in one frame than any
+   * drive can -- is a rest, a scrub, a teleport or the boot's own settle,
+   * and the layer then rebuilds in this frame with nothing fading.  Fading
+   * in a sky the player has just skipped twelve hours to would be a sky
+   * that is visibly wrong for eight seconds.
+   */
+  _move(eye, clock) {
+    const f = this.field;
+    if (!f) return;
+    const ofs = f.ofs;
+    const t = clock ? clock.t : 0;
+    const dt = Number.isFinite(this._lastT) ? t - this._lastT : 0;
+    this._lastT = t;
+    this.time += Math.max(0, Math.min(0.25, dt));
+    this.mat.uniforms.uTime.value = this.time;
+
+    const jumped = !Number.isFinite(this._lastOfs.x)
+      || Math.hypot(ofs.x - this._lastOfs.x, ofs.y - this._lastOfs.y) > JUMP_OFS
+      || Math.hypot(eye.x - this._lastEye.x, eye.z - this._lastEye.z) > JUMP_EYE;
+    this._lastOfs.copy(ofs);
+    this._lastEye.copy(eye);
+
+    /* The eye in the field's frame, which is the only thing that changes
+     * which cells are in range.  Parked, it moves at the wind's speed. */
+    const ex = eye.x + ofs.x, ez = eye.z + ofs.y;
+    const cut = CLOUD_UNIFORMS.uShapeCut.value;
+    const due = !(Math.abs(ex - this._at.x) < REBUILD && Math.abs(ez - this._at.y) < REBUILD
+      && Math.abs(cut - this._cut) < 0.004);
+
+    if (jumped || !Number.isFinite(this._at.x)) {
+      /* From nothing: there is no drawn sky to be continuous with, so no
+       * hysteresis either, and the set is a pure function of the field and
+       * the eye -- the same set a film or a still gets every time. */
+      this.job = null;
+      this.recs.clear();
+      this._at.set(ex, ez);
+      this._cut = cut;
+      const job = this._start(ex, ez, cut);
+      this._scan(job, Infinity);
+      this._commit(job, eye, true);
+    } else {
+      if (!this.job && due) {
+        this._at.set(ex, ez);
+        this._cut = cut;
+        this.job = this._start(ex, ez, cut);
+      }
+      if (this.job && this._scan(this.job, CELLS_PER_FRAME)) {
+        this._commit(this.job, eye, false);
+        this.job = null;
+      }
+    }
+
+    /* And the whole set follows the drift, and the eye's height, from
+     * where its matrices were written.  This is the line that makes the
+     * sky move: one matrix a frame. */
+    const r = this._ref;
+    this.mesh.position.set(-(ofs.x - r.x), eye.y - r.y, -(ofs.y - r.z));
+  }
+
+  /**
+   * Rebuild the whole set now, with nothing fading.  The probes' handle on
+   * the cost of a rescan; the frame never calls it.
    */
   _place(eye) {
     const f = this.field;
     if (!f) return;
-    const ofs = f.ofs;
+    const ex = eye.x + f.ofs.x, ez = eye.z + f.ofs.y;
     const cut = CLOUD_UNIFORMS.uShapeCut.value;
-    if (Math.abs(eye.x - this._at.x) < 240 && Math.abs(eye.z - this._at.z) < 240
-        && Math.abs(ofs.x - this._ofs.x) < 240 && Math.abs(ofs.y - this._ofs.y) < 240
-        && Math.abs(cut - this._cut) < 0.004) return;
-    this._at.copy(eye);
-    this._ofs.copy(ofs);
+    this._at.set(ex, ez);
     this._cut = cut;
+    this.recs.clear();
+    const job = this._start(ex, ez, cut);
+    this._scan(job, Infinity);
+    this._commit(job, eye, true);
+    this.job = null;
+  }
 
-    const mix = CLOUD_UNIFORMS.uShapeMix.value;
-    const base = CLOUD_UNIFORMS.uCloudBase.value;
+  /**
+   * A scan, set up.  Everything it reads is fixed here -- the eye, the cut
+   * and the mix -- so a scan spread over several frames is one scan of one
+   * sky, and the cells are in the field's frame, so the drift during those
+   * frames changes nothing about them.
+   */
+  _start(ex, ez, cut) {
+    return {
+      ex, ez, cut,
+      mix: CLOUD_UNIFORMS.uShapeMix.value,
+      r: 0, j: null, i: null,
+      cand: RINGS.map(() => []),
+    };
+  }
+
+  /**
+   * Walk up to `limit` cells of a scan.  True when it has walked them all.
+   *
+   * Each cell is decided as it always was: one deterministic jitter for its
+   * centre, the march's own test on the march's own field, in or out.  The
+   * cell is in the *field's* frame now -- see `GROW` -- and so is the
+   * sample: `fieldAt` is the field without the drift.
+   *
+   * A cell just outside its ring is still taken if its cluster is already
+   * drawn and alive, which is the hysteresis.  See `HYST`.
+   */
+  _scan(job, limit) {
+    const f = this.field;
+    if (job.cut >= 1.5) {
+      /* A cut this high is `CUT_EMPTY`: the sky is clear and no sample can
+       * reach it, so skip the scan rather than walk eighteen hundred cells
+       * to be told so. */
+      job.r = RINGS.length;
+      return true;
+    }
+    const recs = this.recs;
+    let n = 0;
+    while (job.r < RINGS.length) {
+      const r = job.r;
+      const ring = RINGS[r];
+      const cell = ring.cell;
+      const from = r === 0 ? 0 : RINGS[r - 1].to;
+      const span = Math.ceil((ring.to + HYST) / cell);
+      const cx = Math.floor(job.ex / cell), cz = Math.floor(job.ez / cell);
+      if (job.j === null) { job.j = -span; job.i = -span; }
+      for (; job.j <= span; job.j++, job.i = -span) {
+        for (; job.i <= span; job.i++) {
+          if (n++ >= limit) return false;
+          const ix = cx + job.i, iz = cz + job.j;
+          /* The cell's own point, jittered inside it so the field is not
+           * sampled on a lattice -- a grid of clouds reads as a grid
+           * however good each cloud is. */
+          const x = (ix + 0.18 + 0.64 * hashFloat(ix, iz, 3)) * cell;
+          const z = (iz + 0.18 + 0.64 * hashFloat(ix, iz, 4)) * cell;
+          const d = Math.hypot(x - job.ex, z - job.ez);
+          const key = r * 2 ** 50 + (ix + 2 ** 24) * 2 ** 25 + (iz + 2 ** 24);
+          if (d < from || d >= ring.to) {
+            if (d < from - HYST || d >= ring.to + HYST) continue;
+            const had = recs.get(key);
+            if (!had || had.dies !== Infinity) continue;
+          }
+
+          const f0 = f.fieldAt(x, z, 0);
+          const f2 = f.fieldAt(x, z, 2);
+          const v = f0 + (f2 - 0.5) * job.mix;
+          if (v <= job.cut) continue;
+
+          job.cand[r].push({
+            key, ring: r, x, z, d, v,
+            f1: f.fieldAt(x, z, 1),
+            f2,
+            seed: ((ix * 73856093) ^ (iz * 19349663)) >>> 0,
+            rot: hashFloat(ix, iz, 5) * Math.PI * 2,
+          });
+        }
+      }
+      job.r++;
+      job.j = null;
+    }
+    return true;
+  }
+
+  /**
+   * Turn a finished scan into the drawn set.
+   *
+   * **The budget is in lobes, not in clouds, and it is spent ring by
+   * ring.**  Nearest-first over the whole sky is the wrong cap here and it
+   * is worth saying why, because it is the obvious one: the far ring holds
+   * most of the cells and each of its clouds stands for a much larger
+   * piece of sky, so a global cap spends everything on the near ring and
+   * empties the horizon -- which is precisely the half of the sky an
+   * overcast is read from.  Each ring gets a share, unspent share falls
+   * through to the next, and inside a ring it is nearest first.
+   *
+   * **And every cluster has a life.**  One that the last scan also drew
+   * keeps its birth, so a rescan reproduces it exactly; one that is new is
+   * born now and grows; one the scan no longer wants is given a death time
+   * and shrinks, and stays in the buffers until it has.  `instant` skips
+   * all of that -- everything is grown and nothing lingers -- for a jump.
+   */
+  _commit(job, eye, instant) {
+    const recs = this.recs;
+    const now = this.time;
+    const gen = (this._gen = (this._gen || 0) + 1);
+    const cut = job.cut;
+
+    let budget = this.max * LOBES;
+    let clouds = 0;
+    for (let r = 0; r < RINGS.length; r++) {
+      const ring = RINGS[r];
+      const cand = job.cand[r];
+      cand.sort((a, b) => a.d - b.d);
+      /* This ring's share of what is left, except on the last one, which
+       * takes the remainder: shares that do not add to one would
+       * otherwise leave lobes unspent for no reason. */
+      const share = r === RINGS.length - 1
+        ? budget
+        : Math.min(budget, Math.floor(this.max * LOBES * ring.share));
+      const take = Math.min(cand.length, Math.floor(share / ring.lobes));
+      for (let c = 0; c < take; c++) {
+        const q = cand[c];
+        q.rad = ring.cell * (RAD_MIN + RAD_SPAN * Math.min(1, (q.v - cut) / FULL_AT));
+        let rec = recs.get(q.key);
+        if (!rec) {
+          rec = q;
+          rec.born = instant ? -1e9 : now;
+          recs.set(q.key, rec);
+        } else {
+          rec.rad = q.rad; rec.d = q.d; rec.v = q.v;
+          if (rec.dies !== Infinity) {
+            /* Wanted again while it was dissolving: it grows back from
+             * the size it had got down to rather than starting over. */
+            rec.born = instant ? -1e9 : now - GROW * growth(rec, now);
+          }
+        }
+        rec.dies = Infinity;
+        rec.gen = gen;
+        budget -= ring.lobes;
+        clouds++;
+      }
+    }
+
+    /* Whatever the scan did not ask for starts to go, and whatever has
+     * finished going is let go of. */
+    for (const [k, rec] of recs) {
+      if (rec.gen === gen) continue;
+      if (instant || (rec.dies !== Infinity && now > rec.dies + GROW)) recs.delete(k);
+      else if (rec.dies === Infinity) rec.dies = now;
+    }
+
+    this._write(eye, clouds, instant);
+  }
+
+  /**
+   * The instance buffers, from `recs`.  Live clusters first, then the
+   * dissolving ones while there is room.
+   *
+   * **Each cluster's lobes are worked out once and kept.**  They are
+   * written in a frame that only moves when the drift has carried the sky
+   * `REBASE` metres -- the mesh's own offset covers the rest -- so a
+   * cluster that survives a rescan has exactly the matrices it had, and
+   * this is a copy.  Composing every lobe of every cluster at every rescan
+   * was 3.4 ms here and 6 at a phone's CPU speed, every 27 seconds; only
+   * the clusters that are new, or that a change of cut has resized, pay
+   * that now.
+   */
+  _write(eye, clouds, instant) {
+    const f = this.field;
+    const ref = this._ref;
+    /* The frame the matrices are written in.  Kept until the drift has
+     * moved a long way from it, or the eye has climbed or dropped a long
+     * way, because moving it means rewriting every cluster. */
+    if (instant || !this._refGen
+        || Math.hypot(f.ofs.x - ref.x, f.ofs.y - ref.z) > REBASE
+        || Math.abs(eye.y - ref.y) > 400) {
+      ref.x = f.ofs.x; ref.z = f.ofs.y; ref.y = eye.y;
+      this._refGen = (this._refGen || 0) + 1;
+    }
+
     const mat = this.mesh.instanceMatrix.array;
     const ctr = this.aCloud.array;
     const fade = this.aFade.array;
-    const cand = this._cand;
-    cand.length = 0;
+    const grow = this.aGrow.array;
+    const hub = this.aHub.array;
 
-    /* A cut this high is `CUT_EMPTY`: the sky is clear and no sample can
-     * reach it, so skip the scan rather than walk fourteen hundred cells
-     * to be told so. */
-    /* The budget is in *lobes*, not in clouds, and it is spent ring by
-     * ring.
-     *
-     * Nearest-first over the whole sky is the wrong cap here and it is
-     * worth saying why, because it is the obvious one: the far ring holds
-     * most of the cells and each of its clouds stands for a much larger
-     * piece of sky, so a global cap spends everything on the near ring and
-     * empties the horizon -- which is precisely the half of the sky an
-     * overcast is read from.  Each ring gets a share, unspent share falls
-     * through to the next, and inside a ring it is nearest first. */
-    let budget = this.max * LOBES;
+    /* The live set always fits -- `_commit` spent no more than the budget
+     * on it.  The dissolving ones go in most recent first, so if there is
+     * ever not room for all of them it is the nearly-gone that are cut. */
+    const live = [], dying = [];
+    for (const q of this.recs.values()) (q.dies === Infinity ? live : dying).push(q);
+    dying.sort((a, b) => b.dies - a.dies);
     let off = 0;
-    let clouds = 0;
-    let from = 0;
-    if (cut < 1.5) {
-      for (let r = 0; r < RINGS.length; r++) {
-        const ring = RINGS[r];
-        const cell = ring.cell;
-        const span = Math.ceil(ring.to / cell);
-        const cx = Math.floor(eye.x / cell), cz = Math.floor(eye.z / cell);
-        cand.length = 0;
-        for (let j = -span; j <= span; j++) {
-          for (let i = -span; i <= span; i++) {
-            const ix = cx + i, iz = cz + j;
-            /* The cell's own point, jittered inside it so the field is not
-             * sampled on a lattice -- a grid of clouds reads as a grid
-             * however good each cloud is. */
-            const x = (ix + 0.18 + 0.64 * hashFloat(ix, iz, 3)) * cell;
-            const z = (iz + 0.18 + 0.64 * hashFloat(ix, iz, 4)) * cell;
-            const d = Math.hypot(x - eye.x, z - eye.z);
-            if (d < from || d >= ring.to) continue;
-
-            /* The march's own test, on the march's own field. */
-            const f0 = f.rawAt(x, z, 0);
-            const f2 = f.rawAt(x, z, 2);
-            const v = f0 + (f2 - 0.5) * mix;
-            if (v <= cut) continue;
-
-            cand.push({
-              x, z, d,
-              rad: cell * (RAD_MIN + RAD_SPAN * Math.min(1, (v - cut) / FULL_AT)),
-              f1: f.rawAt(x, z, 1),
-              f2,
-              seed: ((ix * 73856093) ^ (iz * 19349663)) >>> 0,
-              rot: hashFloat(ix, iz, 5) * Math.PI * 2,
-            });
-          }
-        }
-        from = ring.to;
-
-        cand.sort((a, b) => a.d - b.d);
-        /* This ring's share of what is left, except on the last one, which
-         * takes the remainder: shares that do not add to one would
-         * otherwise leave lobes unspent for no reason. */
-        const lobes = ring.lobes;
-        const share = r === RINGS.length - 1
-          ? budget
-          : Math.min(budget, Math.floor(this.max * LOBES * ring.share));
-        const take = Math.min(cand.length, Math.floor(share / lobes));
-
-        for (let c = 0; c < take; c++) {
-          const q = cand[c];
-          /* Base and thickness out of the same two channels the march
-           * hangs them on, so no two clouds sit on one base and no two are
-           * the same height. */
-          const y = eye.y + base - (q.f1 - 0.5) * 220 - (q.f2 - 0.5) * 160;
-          const thick = (TOP - BASE) * (0.38 + 0.62 * smooth01((q.f2 - 0.28) / 0.40));
-          /* How tall this cluster stands, as a multiple of a round one --
-           * and **bounded**, which is the whole of the fix.  What was here
-           * fed `thick` straight into the lobe's y scale against `q.rad`
-           * in x and z, and those two are unrelated numbers: `thick` runs
-           * to 650 m where `rad` is 200 to 330, so the lobes came out up
-           * to 3.8 times taller than wide and a cloud drew as a bunch of
-           * vertical fingers.  The field still decides the aspect -- it is
-           * `thick` divided by the cloud's own width -- it just no longer
-           * decides it without limit. */
-          const vert = Math.min(VERT_MAX, Math.max(VERT_MIN, thick / (q.rad * 1.6)));
-          /* The cluster's middle and its half-height, for the base
-           * shading: a fragment's height within its own cloud has to be
-           * measured against the cloud, or the near ring reads right and
-           * the far ring -- whose clouds are three times the size -- comes
-           * out uniformly pale. */
-          const mid = y + 0.5 * CLUSTER_H * q.rad * vert;
-          const inv = 1 / Math.max(1, 0.5 * CLUSTER_H * q.rad * vert);
-          const fv = 1 - smooth01((q.d - FADE_TO * 0.86) / (FADE_TO * 0.14));
-
-          for (let k = 0; k < lobes; k++) {
-            /* Always out of the same six, so a cloud does not change shape
-             * when it crosses a ring boundary -- it loses its outliers and
-             * keeps its body, which at that distance is a pixel or two. */
-            lobe(q.seed, k, _lobe);
-            /* The yaw turns the cluster about its own axis, so it acts on
-             * the horizontal offset alone; the height comes from `lobe`
-             * unrotated, which is what keeps every base on one plane. */
-            _p.set(_lobe.x * q.rad, 0, _lobe.z * q.rad);
-            _p.applyAxisAngle(_up, q.rot);
-            _p.set(q.x + _p.x, y + _lobe.y * q.rad * vert, q.z + _p.z);
-            /* Fewer lobes have to cover the same cloud, or a far cluster is
-             * a body with nothing around it and the ring shows as a step
-             * in cloud size. */
-            const fat = 1 + (LOBES - lobes) * 0.055;
-            const rs = _lobe.s * q.rad * fat;
-            _s.set(rs, rs * LOBE_SQUASH * vert, rs);
-            /* A tilt and nothing more.  It used to be up to three radians
-             * on two axes, which stands a flattened lobe on its edge --
-             * and a spheroid flattened about y is unchanged by a yaw
-             * anyway, so the large angles bought variety in the one
-             * direction that had none to give.  A few degrees is enough to
-             * stop the bases reading as a single plane. */
-            _e.set(TILT * (hashFloat(q.seed, k, 6) - 0.5),
-                   0, TILT * (hashFloat(q.seed, k, 7) - 0.5));
-            _q.setFromEuler(_e);
-            _m.compose(_p, _q, _s);
-            _m.toArray(mat, off * 16);
-            ctr[off * 2] = mid; ctr[off * 2 + 1] = inv;
-            fade[off] = fv;
-            off++;
-          }
-          budget -= lobes;
-          clouds++;
-        }
+    for (const q of live.concat(dying)) {
+      const lobes = RINGS[q.ring].lobes;
+      if (off + lobes > this.cap) break;
+      if (q.refGen !== this._refGen || Math.abs(q.rad - q.radBuilt) > q.rad * 0.002) this._lobes(q);
+      mat.set(q.mat, off * 16);
+      hub.set(q.hub, off * 3);
+      /* The fade is the one thing that follows the eye rather than the
+       * cluster, and it is one number. */
+      const fv = 1 - smooth01((q.d - FADE_TO * 0.86) / (FADE_TO * 0.14));
+      const born = q.born, dies = q.dies === Infinity ? 1e9 : q.dies;
+      for (let k = 0; k < lobes; k++, off++) {
+        ctr[off * 2] = q.mid; ctr[off * 2 + 1] = q.inv;
+        fade[off] = fv;
+        grow[off * 2] = born; grow[off * 2 + 1] = dies;
       }
     }
 
     this.count = clouds;
+    this.rebuilds++;
     this.mesh.count = off;
     this.mesh.instanceMatrix.needsUpdate = true;
     this.aCloud.needsUpdate = true;
     this.aFade.needsUpdate = true;
+    this.aGrow.needsUpdate = true;
+    this.aHub.needsUpdate = true;
   }
 
+  /** One cluster's lobes, in the current write frame, kept on the record. */
+  _lobes(q) {
+    const ref = this._ref;
+    const base = CLOUD_UNIFORMS.uCloudBase.value;
+    const lobes = RINGS[q.ring].lobes;
+    if (!q.mat || q.mat.length !== lobes * 16) {
+      q.mat = new Float32Array(lobes * 16);
+      q.hub = new Float32Array(lobes * 3);
+    }
+    q.refGen = this._refGen;
+    q.radBuilt = q.rad;
+    const wx = q.x - ref.x, wz = q.z - ref.z;
+    /* Base and thickness out of the same two channels the march
+     * hangs them on, so no two clouds sit on one base and no two are
+     * the same height. */
+    const y = ref.y + base - (q.f1 - 0.5) * 220 - (q.f2 - 0.5) * 160;
+    const thick = (TOP - BASE) * (0.38 + 0.62 * smooth01((q.f2 - 0.28) / 0.40));
+    /* How tall this cluster stands, as a multiple of a round one --
+     * and **bounded**, which is the whole of the fix.  What was here
+     * fed `thick` straight into the lobe's y scale against `q.rad`
+     * in x and z, and those two are unrelated numbers: `thick` runs
+     * to 650 m where `rad` is 200 to 330, so the lobes came out up
+     * to 3.8 times taller than wide and a cloud drew as a bunch of
+     * vertical fingers.  The field still decides the aspect -- it is
+     * `thick` divided by the cloud's own width -- it just no longer
+     * decides it without limit. */
+    const vert = Math.min(VERT_MAX, Math.max(VERT_MIN, thick / (q.rad * 1.6)));
+    /* The cluster's middle and its half-height, for the base
+     * shading: a fragment's height within its own cloud has to be
+     * measured against the cloud, or the near ring reads right and
+     * the far ring -- whose clouds are three times the size -- comes
+     * out uniformly pale. */
+    q.mid = y + 0.5 * CLUSTER_H * q.rad * vert;
+    q.inv = 1 / Math.max(1, 0.5 * CLUSTER_H * q.rad * vert);
+
+    for (let k = 0; k < lobes; k++) {
+      /* Always out of the same six, so a cloud does not change shape
+       * when it crosses a ring boundary -- it loses its outliers and
+       * keeps its body, which at that distance is a pixel or two. */
+      lobe(q.seed, k, _lobe);
+      /* The yaw turns the cluster about its own axis, so it acts on
+       * the horizontal offset alone; the height comes from `lobe`
+       * unrotated, which is what keeps every base on one plane. */
+      _p.set(_lobe.x * q.rad, 0, _lobe.z * q.rad);
+      _p.applyAxisAngle(_up, q.rot);
+      _p.set(wx + _p.x, y + _lobe.y * q.rad * vert, wz + _p.z);
+      /* Fewer lobes have to cover the same cloud, or a far cluster is
+       * a body with nothing around it and the ring shows as a step
+       * in cloud size. */
+      const fat = 1 + (LOBES - lobes) * 0.055;
+      const rs = _lobe.s * q.rad * fat;
+      _s.set(rs, rs * LOBE_SQUASH * vert, rs);
+      /* A tilt and nothing more.  It used to be up to three radians
+       * on two axes, which stands a flattened lobe on its edge --
+       * and a spheroid flattened about y is unchanged by a yaw
+       * anyway, so the large angles bought variety in the one
+       * direction that had none to give.  A few degrees is enough to
+       * stop the bases reading as a single plane. */
+      _e.set(TILT * (hashFloat(q.seed, k, 6) - 0.5),
+             0, TILT * (hashFloat(q.seed, k, 7) - 0.5));
+      _q.setFromEuler(_e);
+      _m.compose(_p, _q, _s);
+      _m.toArray(q.mat, k * 16);
+      q.hub[k * 3] = wx; q.hub[k * 3 + 1] = y; q.hub[k * 3 + 2] = wz;
+    }
+  }
+
+  /** How formed instance `i` is right now, 0..1 -- the shader's own sum,
+   *  for the probes. */
+  grown(i) {
+    const g = this.aGrow.array;
+    return growth({ born: g[i * 2], dies: g[i * 2 + 1] }, this.time);
+  }
   /** The layer, then the ink.  Both before the main render. */
   render(renderer) {
     const prev = renderer.getRenderTarget();
@@ -1127,4 +1437,9 @@ function smooth01(t) {
   if (t <= 0) return 0;
   if (t >= 1) return 1;
   return t * t * (3 - 2 * t);
+}
+
+/** A cluster's size at layer time `now`, 0..1: the vertex shader's sum. */
+function growth(rec, now) {
+  return smooth01((now - rec.born) / GROW) * (1 - smooth01((now - rec.dies) / GROW));
 }

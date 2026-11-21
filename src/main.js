@@ -35,6 +35,7 @@ import { Save } from './core/save.js';
 import { hashFloat } from './core/rng.js';
 import { Sound } from './audio/sound.js';
 import { TIERS, pickTier, gpuName, ResolutionGovernor } from './core/quality.js';
+import { PlacePlan } from './world/placeplan.js';
 
 /* ------------------------------------------------------------------ *
  * country-road -- entry point.
@@ -58,6 +59,11 @@ import { TIERS, pickTier, gpuName, ResolutionGovernor } from './core/quality.js'
 await initRapier();
 
 const params = new URLSearchParams(location.search);
+
+/** Which build this is -- see `vite.config.js`.  The label on screen is
+ *  static markup; this is for the console, `?debug` and the probes. */
+const VERSION = 'v.' + __COMMIT__;
+console.info('[country-road]', VERSION);
 
 /* ------------------------------- the save -------------------------------- *
  * Read before anything is built, because the seed itself can come out of it:
@@ -356,6 +362,25 @@ let roadLead = NEED();
 road.extend(0, LEAD_PIN ? NEED() * LEAD_PIN : NEED() * 1.6, 20000, 600);
 const scatter = new Scatter(scene, terrain, road, { seed: SEED });
 const furniture = new Furniture(scene, terrain, road);
+
+/* --------------------------------- places -------------------------------- *
+ * Towns, farms and signposts -- `prompt_5.md`, after `suggest_4.md` §1.
+ *
+ * The *schedule* is here from the start: it is a few hundred lines with no
+ * geometry in it, and the load screen wants it to say where a saved drive
+ * is.  Everything that builds a place comes in by a dynamic import that
+ * nothing waits on (`loadPlaces`, started by `boot`): the first place is
+ * usually kilometres away, and the first load should not wait for it.
+ * `?places=off` leaves them out, for A/B frame times. */
+const plan = new PlacePlan(SEED);
+const PLACES = params.get('places') !== 'off';
+/** The live `Places`, once it has arrived; null until then. */
+let places = null;
+function loadPlaces() {
+  return import('./world/places.js').then(({ Places }) => {
+    places = new Places(scene, terrain, road, scatter, { plan, lamps: Q.lamps, seed: SEED });
+  });
+}
 const sky = new Sky(scene, VIEW * 1.12);   // inside camera.far, deliberately
 /* The volumetric layer.  `?clouds=off` puts the bare dome back, which the
  * seam probe needs; `?clouds=full` marches at full resolution, which is
@@ -936,7 +961,7 @@ async function openMenu() {
   const miles = (odometer / 1609.344).toFixed(1);
   sound.setPaused(true);
   const how = await loader.pause(
-    `${miles} miles · ${clock.season.name} · ${clock.clockText}`);
+    `${miles} miles · ${plan.where(roadS)} · ${clock.season.name} · ${clock.clockText}`);
   if (how === 'new') { freshStart(); return; }
   paused = false;
   sound.setPaused(false);
@@ -1091,6 +1116,10 @@ function paintWorld(dt, w, { moving = true, braking = false } = {}) {
 
   headlights.update(clock, car, w.wetness);
   headlights.paint(coupe, braking);
+  if (places) {
+    places.paint(dt, camera, clock, car, headlights, atmos,
+                 pipeline ? pipeline.rtScene.height : renderer.domElement.height);
+  }
 }
 
 /**
@@ -1120,6 +1149,11 @@ function listen(dt, w, axes, lapsing) {
   _ear.sunAlt = clock.sun.alt;
   sound.update(dt, _ear);
 }
+
+/** Where the car is along the road, as of the last frame.  For the pause
+ *  menu's "near Wattle Creek": `auto.s` is only kept up to date while the
+ *  autopilot is holding something. */
+let roadS = 0;
 
 /* Scratch for the per-frame road queries.  Two objects rather than two
  * allocations a frame. */
@@ -1207,6 +1241,7 @@ function tick(dt) {
    * to be thrown away and rebuilt once the road arrives. */
   const q = road.nearest(car.pos.x, car.pos.z, _near);
   const s = q ? q.s : 0;
+  roadS = s;
   /* **Which way along the road the car is pointing.**
    *
    * The arc coordinate is signed since `prompt_5.md` item 4, so "ahead"
@@ -1265,8 +1300,17 @@ function tick(dt) {
   /* Four boxes, not two: one dirty and one laid **per line**.  Merging
    * the two lines' boxes into one spans the whole road and invalidates the
    * ground under the car -- see `RoadPath.laidBoxes`. */
-  for (const box of [...road.takeDirtyBoxes(), ...road.takeLaidBoxes()]) {
-    if (box) chunks.invalidate(box.minX - 64, box.minZ - 64, box.maxX + 64, box.maxZ + 64);
+  /* And the places, from the same boxes in the same pass, because `take*`
+   * hands each box over once: a town whose road was taken back, or that a
+   * stretch of new road now runs through, is sited again. */
+  const dirty = road.takeDirtyBoxes();
+  for (const box of [...dirty, ...road.takeLaidBoxes()]) {
+    if (!box) continue;
+    chunks.invalidate(box.minX - 64, box.minZ - 64, box.maxX + 64, box.maxZ + 64);
+    if (places) {
+      places.invalidate(box.minX - 64, box.minZ - 64, box.maxX + 64, box.maxZ + 64,
+                        dirty.includes(box));
+    }
   }
 
   /* 2. controls.
@@ -1294,6 +1338,7 @@ function tick(dt) {
   colliderUnder();
   physics.syncRails(furniture, road, car.pos.x, car.pos.z);
   physics.syncTrees(scatter, car.pos.x, car.pos.z);
+  physics.syncPlaces(places, car.pos.x, car.pos.z);
   car.update(dt, axes);
   car.applyTo(coupe.group);
   /* The wheels, on three channels that must not be the same object -- see
@@ -1314,6 +1359,12 @@ function tick(dt) {
   // 4. the ground under it
   const fx = Math.cos(car.yaw), fz = Math.sin(car.yaw);
   chunks.update(car.pos.x, car.pos.z, fx, fz, dt);
+  /* Places before the scatter, so a yard is known before the wood that
+   * would grow in it is built. */
+  if (places) {
+    const town = places.update(s, auto.dir, car);
+    if (town) hud.toast(town, simTime, 2.6);
+  }
   scatter.update(car.pos.x, car.pos.z);
   furniture.update(Math.max(0, s - 200), s + 620);
 
@@ -1466,6 +1517,9 @@ const debug = params.get('debug') === '1' ? (() => {
     + 'font:11px/1.35 ui-monospace,Menlo,Consolas,monospace;color:#fff;'
     + 'background:rgba(0,0,0,.55);pointer-events:none;white-space:pre';
   document.body.appendChild(el);
+  /* The overlay sits in the version label's corner, so it hides the label
+   * and says the version itself. */
+  document.body.classList.add('debug');
   let acc = 0, n = 0, worst = 0;
   return {
     frame(dt) {
@@ -1475,7 +1529,7 @@ const debug = params.get('debug') === '1' ? (() => {
       const bt = Object.entries(chunks.buildTimes)
         .map(([k, v]) => `${k}m ${(v.ms / v.n).toFixed(0)}ms`).join('  ');
       el.textContent = [
-        `${TIER.name} (${TIER.why})  ${GPU}`,
+        `${VERSION}  ${TIER.name} (${TIER.why})  ${GPU}`,
         `dpr ${devicePixelRatio}  css ${innerWidth}x${innerHeight}  canvas ${cv.width}x${cv.height}`,
         p ? `scene ${p.rtScene.width}x${p.rtScene.height} (${p.scale.toFixed(2)}x css)  route ${p.mode}` : 'no pipeline',
         `fps ${(n / acc).toFixed(0)}  worst ${(worst * 1000).toFixed(0)}ms  governor ${governor.scale}`
@@ -1545,6 +1599,9 @@ loader.step('scenery');
 if (RECORDING) {
   document.body.classList.add('clean');
   hud.clean = true;
+  /* A film has its places from frame zero: the import is awaited here,
+   * before the settle, rather than arriving at whatever frame it lands. */
+  if (PLACES) await loadPlaces();
   /* Settle the world before frame zero: the chunk builder is on a 4 ms
    * budget, so a cold start films forty frames of empty hillside. */
   for (let i = 0; i < 90; i++) step(1 / 30);
@@ -1561,6 +1618,11 @@ if (RECORDING) {
  * fallback if it never lands.
  */
 async function boot() {
+  /* Fetched now and not awaited: 18 kB beside a car that is megabytes,
+   * so it has landed long before the click, and a drive resumed in the
+   * middle of a town does not watch the town arrive.  Nothing waits on it
+   * -- see `loadPlaces`. */
+  if (PLACES) loadPlaces();
   await Promise.race([carReady, sleep(2500)]);
   loader.step('car');
   await Promise.race([celestial.ready, sleep(1500)]);
@@ -1586,7 +1648,7 @@ async function boot() {
 
   if (resumable) {
     const miles = (resumable.odometer / 1609.344).toFixed(1);
-    loader.offerResume(`${miles} miles · ${clock.season.name} · ${clock.clockText}`);
+    loader.offerResume(`${miles} miles · ${plan.where(startS)} · ${clock.season.name} · ${clock.clockText}`);
   }
   loader.offer();
 
@@ -1609,7 +1671,10 @@ window.__game = {
   car, chase, auto, input, hud, sky, furniture, pipeline, physics, pointer,
   sound,
   clock, weather, atmos, celestial, precip, headlights, save, loader, lapse,
-  cloudField, clouds, touch, governor, groundWatch, stats,
+  cloudField, clouds, touch, governor, groundWatch, stats, plan,
+  /** `Places`, once its import has landed; null before that and under
+   *  `?places=off`. */
+  get places() { return places; },
   /** Which tier, why, and on what -- see `core/quality.js`. */
   quality: { tier: TIER.name, why: TIER.why, gpu: GPU },
   /** For `tools/probe/rest.mjs`: what `Z` would do, and doing it. */
@@ -1726,4 +1791,5 @@ window.__game = {
   },
   seed: seedText,
   seedNumber: SEED,
+  version: VERSION,
 };

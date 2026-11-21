@@ -451,7 +451,16 @@ export class CloudField {
 
   /** The raw field at a world position, exactly as the shader reads it. */
   rawAt(x, z, channel = 0) {
-    const ox = x + this.ofs.x, oz = z + this.ofs.y;
+    return this.fieldAt(x + this.ofs.x, z + this.ofs.y, channel);
+  }
+
+  /**
+   * The raw field at a point in the field's *own* frame -- a world point
+   * plus the drift.  The drawn cloud layer keeps its grid here, so that a
+   * cloud is a fixed point of the field and moves with it.  See
+   * `cloudgeo.js`, `GROW`.
+   */
+  fieldAt(ox, oz, channel = 0) {
     const a = this._tap(ox / TILE, oz / TILE, channel);
     const b = this._tap(ox / TILE * BREAK_SCALE + 0.137,
                         oz / TILE * BREAK_SCALE + 0.137, channel);

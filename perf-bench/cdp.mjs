@@ -4,7 +4,12 @@ const HEADLESS = process.env.HEADLESS === '1';
  * hours, and the probes should not have to wait for it.  `env` is added
  * to Chrome's environment, which is how the film asks for the discrete
  * GPU on a hybrid-graphics laptop. */
-export async function launch({ w = 1920, h = 1080, port = 9333, profile = `${process.cwd()}/chrome-prof`,
+/* `CDP_PORT` moves the default, with a profile of its own, so a long run
+ * (a soak, a film) and the probes can share a machine without sharing a
+ * browser.  An explicit `port` still wins. */
+const ENV_PORT = Number(process.env.CDP_PORT) || 0;
+export async function launch({ w = 1920, h = 1080, port = ENV_PORT || 9333,
+                               profile = `${process.cwd()}/chrome-prof${ENV_PORT ? '-' + ENV_PORT : ''}`,
                                env = {}, args: extra = [] } = {}) {
   const args = [`--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check', `--window-size=${w},${h}`, '--window-position=0,0',

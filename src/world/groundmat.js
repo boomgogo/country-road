@@ -4,6 +4,7 @@ import { CEL, gradientMap, shadowTint } from '../core/toon.js';
 import { CARRIAGEWAY, SHOULDER } from './terrain.js';
 import { SEASON_UNIFORMS, SEASON_PARS } from './season.js';
 import { patchClouds } from './cloudfield.js';
+import { patchLamps } from './lamps.js';
 
 /* ------------------------------------------------------------------ *
  * The ground material.
@@ -303,5 +304,8 @@ export function groundMaterial() {
    * world whose direct term is quantised into three flat bands.  One
    * material instance serves every chunk, so this costs one patch. */
   patchClouds(mat, 'ground');
+  /* And the street lights' pools, which is how a town at night puts light
+   * on the road through it.  Zero cost by day -- see `lamps.js`. */
+  patchLamps(mat, 'ground');
   return mat;
 }

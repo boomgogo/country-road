@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { patchSeason } from '../world/season.js';
 import { patchClouds } from '../world/cloudfield.js';
+import { patchLamps } from '../world/lamps.js';
 import { cel } from '../core/toon.js';
 import { STEP } from './trace.js';
 import { CARRIAGEWAY } from '../world/terrain.js';
@@ -45,6 +46,7 @@ export class Furniture {
      * snowfield is more conspicuous than the snow is. */
     for (const m of [this.matRail, this.matPost]) {
       patchClouds(m, 'rail');
+      patchLamps(m, 'rail');
       patchSeason(m, {
         fragment: `
           diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.94, 0.96, 1.0 ),

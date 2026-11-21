@@ -50,7 +50,7 @@ export function rng(seed) {
  */
 export async function openGame({
   clock = 'stepped', seed = 'country', query = '', port = 5178,
-  cdpPort = 9333, profile, w = 1280, h = 720, dpr = 1, throttle = 1, env = {},
+  cdpPort = Number(process.env.CDP_PORT) || 9333, profile, w = 1280, h = 720, dpr = 1, throttle = 1, env = {},
   headless = process.env.HEADLESS === '1',
 } = {}) {
   if (headless) process.env.HEADLESS = '1';

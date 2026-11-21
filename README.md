@@ -69,6 +69,10 @@ others) and skips the load screen.
 the canvas and scene sizes and which route the picture took to the screen,
 the frame rate and the governor's level, and whether the ground is keeping
 up with the car. It is the thing to screenshot when a device looks wrong.
+Its first line is the build's version, which is otherwise the small `v.xxxx`
+in the top-left corner: the first four hex digits of the commit the page was
+built from (`vite.config.js` works it out; a checkout with no git says
+`v.dev`). The label is hidden in films, by `H`, and under `?debug=1`.
 
 `?t=18:20`, `?season=autumn`, `?weather=heavyRain` and `?day=7` pin the sky, and
 they are useful for screenshots — with a 24-minute day and hourly weather, a
@@ -78,9 +82,36 @@ dome back and `?clouds=full` marches the layer at full resolution. `?sky=only`
 hides the world so the frame is dome plus cloud layer and nothing else.
 `?fresh` ignores the saved drive.
 
+`?places=off` leaves out the towns, farms and signs, for A/B frame times.
+
 Every drive starts on a **spring morning** — day 1 of the twelve-day year, at
 08:00. The landscape, the weather and the moon are still seeded; only the
 calendar is fixed, so a first thirty seconds is the same first thirty seconds.
+
+## Places
+
+The road goes through somewhere now. Every fifteen to twenty-five kilometres
+there is a **town** — a pub with an upstairs veranda, a servo, a hall or a
+little timber church, a war memorial in the middle, a dozen houses on
+stumps, street lights — and every two to four kilometres between them a
+**landmark**: a farmhouse with its shed and windbreak, a woolshed and its
+yards, a pair of silos, a windmill and its tank, a lookout. Green
+**distance signs** say how far the next two towns are, and each town has its
+name and a 60 at both ends. The first town on a new drive is about four
+kilometres up the road; the first sign is at the start.
+
+Where a place is is a pure function of the seed and the distance along the
+road (`world/placeplan.js`), so a sign twelve kilometres out is exact before
+the road there has been traced, and nothing new is saved. The buildings
+stand on the land as it is — stumps, plinths, ring footings — and never
+reshape it; a lot whose ground is too steep stays empty. All of it is a
+separate download that nothing waits for, so the first load does not change.
+
+At night the windows come on through the dusk one by one and most go off
+between ten and one; porch lights, the servo and the street lights stay on
+till dawn. Street lights put a pool of light on the road, and a town's glow
+is on the horizon from a few kilometres away. None of it is a `THREE.Light`
+— see `world/lamps.js` for why.
 
 ---
 
@@ -111,7 +142,12 @@ About 11 frames a second on an Intel HD 630, so two game-days is two hours.
 The probes behind `prompt_4.md`'s fixes are in `perf-bench/`: `dpr.mjs` (what
 reaches the panel on a high-density screen), `void.mjs` (does the ground keep
 up on a throttled CPU), `seam.mjs` (holes in the ground, counted),
-`far.mjs` (the world a long way from the origin).
+`far.mjs` (the world a long way from the origin). And `prompt_5.md`'s:
+`trees.mjs` (does every tree you can hit have a collider), `cloudmove.mjs`
+(does the sky drift, or freeze and jump), `places.mjs` (are the places
+standing where they should — and, with `MODE=cost`, what a town costs).
+`CDP_PORT=9444` runs any of them, or `autoplay.mjs`, in a browser of its own,
+so a long run and a probe can share a machine.
 
 
 ## Credit

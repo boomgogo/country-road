@@ -329,6 +329,33 @@
                 right: 50%; transform: translateX(50%);
                 border: 1px solid rgba(255,255,255,.22); border-bottom: 0; }
       }
+
+      /* ---------------------------------------------------------------
+         Which build this is.
+
+         Top left, because it is the one corner nothing wants on either
+         device, driving or paused: the desktop's distance and speed own
+         the bottom corners and the fork link the top right; on a phone
+         the pad and the pedals own the bottom and the button strip the
+         top right.  Above the stack, which starts at 20 px here and 48 on
+         a phone.
+
+         Outside both `#load` and `.hud`, so one element is on the load
+         screen, the pause menu and the drive -- and above the load
+         screen's z-index for the same reason.  `%COMMIT%` is written by
+         the build; see `vite.config.js`.  Not in films (`body.clean`),
+         not with the HUD off (`H`), and not under `?debug=1`, whose
+         overlay sits in this corner and carries the version itself.
+         --------------------------------------------------------------- */
+      .ver {
+        position: fixed; z-index: 11; margin: 0; pointer-events: none;
+        top: calc(6px + env(safe-area-inset-top));
+        left: calc(8px + env(safe-area-inset-left));
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 9px; letter-spacing: .22em; line-height: 1;
+        color: #fff; opacity: .35; text-shadow: 0 1px 2px rgba(0,0,0,.45);
+      }
+      body.clean .ver, body.hud-off .ver, body.debug .ver { display: none; }
     </style>
   </head>
   <body>
@@ -348,6 +375,7 @@
       <a class="fork" id="load-fork" href="https://github.com/boomgogo/country-road"
          target="_blank" rel="noopener">fork me on github</a>
     </div>
+    <p class="ver" id="ver">v.%COMMIT%</p>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

@@ -177,6 +177,10 @@ export class Hud {
   toggle() {
     this.visible = !this.visible;
     this.el.style.display = this.visible ? '' : 'none';
+    /* And a body class, for what is on screen but not inside `.hud` --
+     * the version label in `index.html`, which has to live outside it to
+     * be on the load screen as well. */
+    document.body.classList.toggle('hud-off', !this.visible);
     return this.visible;
   }
 

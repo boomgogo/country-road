@@ -20,6 +20,7 @@ import { CHUNK, ChunkField } from '../world/chunks.js';
  *   terrain    every live chunk within `radius`      the ground
  *   guardrail  every furniture batch within reach    *this is the fence*
  *   trees      trunks, close in only                 so off-road has cost
+ *   places     buildings, posts, poles, yard trees   so a town is solid
  *
  * The guardrail is the interesting one.  "The car should be able to drive
  * off the road when there's no fence" makes `Furniture`'s placement rule
@@ -44,6 +45,13 @@ function boxDist(x, z, minX, minZ, size) {
   return Math.hypot(dx, dz);
 }
 
+/** The same, for a box given by its corners. */
+function boxDistRect(x, z, b) {
+  const dx = Math.max(b.minX - x, 0, x - b.maxX);
+  const dz = Math.max(b.minZ - z, 0, z - b.maxZ);
+  return Math.hypot(dx, dz);
+}
+
 export class Physics {
   constructor(opts = {}) {
     this.world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
@@ -60,7 +68,8 @@ export class Physics {
 
     this.terrain = new Map();     // chunk key -> { collider, chunk }
     this.rails = new Map();       // furniture batch key -> { colliders, group }
-    this.trees = new Map();       // scatter chunk key -> colliders
+    this.trees = new Map();       // scatter chunk key -> { list, colliders }
+    this.places = new Map();      // place record -> colliders
 
     this.acc = 0;
     this.steps = 0;
@@ -180,31 +189,97 @@ export class Physics {
    * under is right, and a cylinder per trunk is enough to make leaving
    * the road cost something.  95 m, because past that they are decoration
    * and the car cannot reach them before the ring moves.
+   *
+   * **Per chunk, and all of a chunk's trunks at once** -- which is the fix
+   * for `prompt_5.md`'s "only one tree in a hundred has a collider".  This
+   * used to make colliders only for the trunks within 95 m *on the first
+   * frame any of them was*, and then mark the whole 128 m chunk done: the
+   * one to three trunks at its near edge got cylinders and the other
+   * sixty-odd never did, for as long as the chunk lived.
+   *
+   * Now a chunk is either in range by its *box* (the test terrain uses)
+   * and has every trunk, or out of it and has none.  About nine chunks and
+   * a few hundred static cylinders, which the broadphase does not notice;
+   * per-trunk add and drop would be more exact and more work every frame,
+   * and buys nothing at this radius.
+   *
+   * And by identity, as terrain is: a scatter chunk rebuilt under the same
+   * key -- `Places` does that when a clearing arrives -- is a new list, and
+   * the colliders have to follow it or the car hits the tree that was
+   * cleared and drives through the one left standing.
    */
   syncTrees(scatter, x, z) {
     if (!scatter.trunks) return;
     for (const [k, list] of scatter.trunks) {
-      if (this.trees.has(k) || !list.length) continue;
-      const c0 = list.centre;
-      if (c0 && Math.hypot(c0.x - x, c0.z - z) > this.treeRadius + CHUNK) continue;
+      if (!list.length || !list.box) continue;
+      const b = list.box;
+      if (boxDist(x, z, b.x, b.z, CHUNK) > this.treeRadius) continue;
+      const have = this.trees.get(k);
+      if (have && have.list === list) continue;
+      if (have) this._dropAll(have.cols);
       const cols = [];
       for (const t of list) {
-        if (Math.hypot(t.x - x, t.z - z) > this.treeRadius) continue;
         cols.push(this.world.createCollider(
           RAPIER.ColliderDesc.cylinder(t.h / 2, t.r)
             .setTranslation(t.x, t.y + t.h / 2, t.z)
             .setFriction(0.6)));
       }
-      if (cols.length) this.trees.set(k, cols);
+      this.trees.set(k, { list, cols });
     }
 
-    for (const [k, cols] of [...this.trees]) {
+    for (const [k, e] of [...this.trees]) {
       const list = scatter.trunks.get(k);
-      const c0 = list && list.centre;
-      if (list && c0 && Math.hypot(c0.x - x, c0.z - z) <= this.treeRadius + CHUNK * 1.5) continue;
-      for (const c of cols) this.world.removeCollider(c, false);
+      if (list === e.list &&
+          boxDist(x, z, list.box.x, list.box.z, CHUNK) <= this.treeRadius * 1.25) continue;
+      this._dropAll(e.cols);
       this.trees.delete(k);
     }
+  }
+
+  /* ------------------------------- places ------------------------------ */
+
+  /**
+   * Buildings, tanks, signposts, street lights and the trees a place
+   * planted -- per *place*, decided by the place's own box, and all of its
+   * colliders at once.  Which is the lesson of `syncTrees` above: the unit
+   * a collider set is kept by has to be the unit it is built by, or most
+   * of it is never built at all.
+   *
+   * By identity: a place that was dropped and sited again is a new record
+   * and gets new colliders.
+   */
+  syncPlaces(places, x, z) {
+    if (!places) return;
+    for (const p of places.live.values()) {
+      if (!p.colliders.length || this.places.has(p)) continue;
+      const b = p.box;
+      if (boxDistRect(x, z, b) > this.radius) continue;
+      const cols = [];
+      for (const c of p.colliders) {
+        const desc = c.type === 'box'
+          ? RAPIER.ColliderDesc.cuboid(c.hx, c.hy, c.hz).setRotation(yawQuat(c.yaw))
+          : RAPIER.ColliderDesc.cylinder(c.hh, c.r);
+        cols.push(this.world.createCollider(desc.setTranslation(c.x, c.y, c.z).setFriction(0.6)));
+      }
+      this.places.set(p, cols);
+    }
+    for (const [p, cols] of [...this.places]) {
+      const live = places.live.get(p.key) === p;
+      if (live && boxDistRect(x, z, p.box) <= this.radius * 1.25) continue;
+      this._dropAll(cols);
+      this.places.delete(p);
+    }
+  }
+
+  _dropAll(cols) {
+    for (const c of cols) this.world.removeCollider(c, false);
+  }
+
+  /** How many trunk colliders exist, for `perf-bench/trees.mjs`. */
+  get treeColliders() {
+    let n = 0;
+    for (const e of this.trees.values()) n += e.cols.length;
+    return n;
   }
 
   /* -------------------------------- time ------------------------------- */

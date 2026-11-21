@@ -28,7 +28,7 @@ import { patchClouds } from './cloudfield.js';
  * deciduous -- repeated at varying scale read as a pattern, and a third
  * form low to the ground does more for that than a fourth tree would: it breaks the line
  * where the canopies stop and the grass starts. */
-const SPECIES = [
+export const SPECIES = [
   {
     name: 'broadleaf', h: [4.5, 8.5], w: 0.66, trunk: 0.075, trunkH: 0.45, bark: 0x5c4f40,
     palette: ['#2f4423', '#456031', '#5d7a3c'],
@@ -276,6 +276,48 @@ export class Scatter {
      * against four different tests and the only cheap way to know where a
      * tree ended up is to have been there when it was put down. */
     this.trunks = new Map();
+    /** Ground that is somebody's yard: `(x, z) => bool`, or null.  Set by
+     *  `Places` once it has arrived; see `invalidate`. */
+    this.blocked = null;
+  }
+
+  /**
+   * Throw away every live chunk touching a box, so the next `update`
+   * grows it again.  `Places` calls this when a clearing arrives or goes:
+   * placement is a pure function of the chunk, so the rebuild is the same
+   * wood with the yard taken out of it -- and `Physics.syncTrees` notices
+   * the new trunk list by identity and follows it.
+   */
+  invalidate(minX, minZ, maxX, maxZ) {
+    const i0 = Math.floor(minX / CHUNK), i1 = Math.floor(maxX / CHUNK);
+    const j0 = Math.floor(minZ / CHUNK), j1 = Math.floor(maxZ / CHUNK);
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const k = cellKey(i, j);
+        const group = this.live.get(k);
+        if (!group) continue;
+        for (const m of group) { this.scene.remove(m); this.pool[m.userData.sp].push(m); }
+        this.live.delete(k);
+        this.trunks.delete(k);
+      }
+    }
+  }
+
+  /**
+   * One tree's instance matrix and trunk record, exactly as `_build` makes
+   * them -- for the trees a place plants itself (a farm's windbreak, a
+   * yard's shade tree), which have to be the same trees as the wood's or
+   * they would not turn with the seasons together.
+   */
+  plant(sp, x, y, z, h, rot, jx = 1, jz = 1) {
+    const S = SPECIES[sp];
+    _p.set(x, y - 0.2, z);
+    _q4.setFromAxisAngle(_up, rot);
+    _s.set(h * S.w * jx, h, h * S.w * jz);
+    const matrix = new THREE.Matrix4().compose(_p, _q4, _s);
+    const trunk = sp === 2 ? null
+      : { x, z, y: y - 0.2, r: S.trunk * Math.max(_s.x, _s.z) * 1.05, h: h * S.trunkH + 0.8 };
+    return { matrix, trunk };
   }
 
   /** Woods rather than a sprinkle: a slow field gates whole hillsides. */
@@ -349,6 +391,14 @@ export class Scatter {
       // never in the road, and never so close that a branch is in the windscreen
       const q = this.road.nearest(x, z, {});
       if (q && q.d < 14) continue;
+      /* ...and never in somebody's yard.  The five draws a planted tree
+       * would have taken are taken anyway, so that clearing a yard takes
+       * out the trees in it and moves none of the others: the stream past
+       * this point is the stream a chunk with no yard in it gets. */
+      if (this.blocked && this.blocked(x, z)) {
+        rand(); rand(); rand(); rand(); rand();
+        continue;
+      }
 
       /* Scrub outnumbers trees, which is what a hillside actually looks
        * like, and it is what fills the gap between the canopy line and the
@@ -362,7 +412,17 @@ export class Scatter {
       _s.set(h * S.w * (0.85 + rand() * 0.3), h, h * S.w * (0.85 + rand() * 0.3));
       mats[sp].push(new THREE.Matrix4().compose(_p, _q4, _s));
       counts[sp]++;
-      if (sp !== 2) trunks.push({ x, z, y: y - 0.2, r: S.trunk * 1.35, h: h * S.trunkH + 0.8 });
+      /* The radius **as drawn**, which is the unit trunk's base radius
+       * times the instance's own scale across.  It was `S.trunk * 1.35`
+       * -- the unit geometry's number, with the scale left out -- which
+       * is about 0.10 m against a drawn trunk of about 0.32, so a glancing
+       * hit went a hand's width into the bark before anything happened.
+       * The wider of the two axes, and a twentieth over, because the
+       * trunk tapers and a collider that shows bark through it is worse
+       * than one a few centimetres proud of it. */
+      if (sp !== 2) {
+        trunks.push({ x, z, y: y - 0.2, r: S.trunk * Math.max(_s.x, _s.z) * 1.05, h: h * S.trunkH + 0.8 });
+      }
     }
 
     const group = [];
@@ -377,7 +437,9 @@ export class Scatter {
       group.push(inst);
     }
     this.live.set(key, group);
-    trunks.centre = { x: ox + CHUNK / 2, z: oz + CHUNK / 2 };
+    /* The chunk's own square, which is what the physics decides range by:
+     * a box distance, the same test terrain colliders use. */
+    trunks.box = { x: ox, z: oz };
     this.trunks.set(key, trunks);
   }
 }
